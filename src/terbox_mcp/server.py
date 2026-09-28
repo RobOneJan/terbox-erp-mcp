@@ -12,7 +12,14 @@ from starlette.responses import JSONResponse
 
 from terbox_mcp import approvals
 from terbox_mcp.client import TerboxApiError, TerboxClient
-from terbox_mcp.models import BoxAngebotRequest, BoxConfig, KundeRequest, KundeResponse
+from terbox_mcp.models import (
+    ApprovalStatusDTO,
+    BoxAngebotRequest,
+    BoxConfig,
+    KundeRequest,
+    KundeResponse,
+    PendingApprovalDTO,
+)
 
 load_dotenv()
 
@@ -62,19 +69,24 @@ def _resolve_tenant_id(ctx: Context) -> str:
     return headers.get(_TENANT_HEADER) or headers.get(_TENANT_HEADER.lower()) or approvals.DEFAULT_TENANT_ID
 
 
-def _pending_response(request: approvals.ApprovalRequest, message: str) -> dict:
+def _pending_response(request: approvals.ApprovalRequest, message: str) -> PendingApprovalDTO:
     """Shape a freshly-created pending approval the way agent-hub's
     orchestrator generically detects (`_looks_like_pending_approval`):
     `id` (str), `status == "pending"`, `message` (str) - plus `payload`,
     which is this server's addition carrying the full human-reviewable
     detail (every field of the underlying request, flattened to strings).
-    """
-    return {
-        "id": request.id,
-        "status": request.status,
-        "message": message,
-        "payload": request.payload,
-    }
+
+    Must return the `PendingApprovalDTO` model, not a plain dict - see that
+    model's own docstring for why a bare dict return leaves
+    `structured_content` empty and silently breaks the whole approval-card
+    flow (confirmed in production, 2026-09-28: the customer/quote approval
+    never reached Teams, the LLM only knew the id from its own text reply)."""
+    return PendingApprovalDTO(
+        id=request.id,
+        status=request.status,
+        message=message,
+        payload=request.payload,
+    )
 
 
 def _approval_error(exc: approvals.ApprovalNotFoundError | approvals.ApprovalStateError, approval_id: str) -> dict:
@@ -109,7 +121,7 @@ def ab1000_bom_xlsx(config: BoxConfig) -> dict:
 
 
 @mcp.tool()
-def ab1000_kunde(ctx: Context, kunde: KundeRequest) -> dict:
+def ab1000_kunde(ctx: Context, kunde: KundeRequest) -> PendingApprovalDTO:
     """Request human approval to create or find a customer in SevDesk.
 
     This validates the customer details and stores them as a pending
@@ -156,7 +168,7 @@ def ab1000_kunde_execute(ctx: Context, approval_id: str) -> KundeResponse | dict
 
 
 @mcp.tool()
-def ab1000_angebot_konfiguration(ctx: Context, request: BoxAngebotRequest) -> dict:
+def ab1000_angebot_konfiguration(ctx: Context, request: BoxAngebotRequest) -> PendingApprovalDTO:
     """Request human approval to generate a quote and create a SevDesk draft.
 
     This validates the box configuration, customer reference and any extras,
@@ -209,7 +221,7 @@ def ab1000_angebot_konfiguration_execute(ctx: Context, approval_id: str) -> dict
 
 
 @mcp.tool()
-def ab1000_approval_status(ctx: Context, approval_id: str) -> dict:
+def ab1000_approval_status(ctx: Context, approval_id: str) -> ApprovalStatusDTO | dict:
     """Check the current status of a pending ab1000_kunde or
     ab1000_angebot_konfiguration approval request.
 
@@ -222,12 +234,12 @@ def ab1000_approval_status(ctx: Context, approval_id: str) -> dict:
         request = approvals.get(approval_id, tenant_id)
     except approvals.ApprovalNotFoundError as exc:
         return _approval_error(exc, approval_id)
-    return {
-        "id": request.id,
-        "status": request.status,
-        "resource_id": request.resource_id,
-        "payload": request.payload,
-    }
+    return ApprovalStatusDTO(
+        id=request.id,
+        status=request.status,
+        resource_id=request.resource_id,
+        payload=request.payload,
+    )
 
 
 # Deliberately NOT MCP tools - same reasoning as email-mcp-server's own

@@ -103,3 +103,27 @@ class BoxAngebotRequest(BaseModel):
     sevdesk_contact_id: str
     datum: Optional[str] = None
     extras: list[AngebotPosition] = Field(default_factory=list)
+
+
+class PendingApprovalDTO(BaseModel):
+    """Wire shape for a freshly-created pending approval - must be a Pydantic
+    model, not a plain dict: this MCP SDK only populates `CallToolResult.
+    structured_content` (what agent-hub's orchestrator._looks_like_pending_approval
+    actually inspects - see that function's own docstring) for a tool whose
+    return type is a BaseModel. A bare `-> dict` return serializes fine as
+    text content but leaves structured_content=None, so the orchestrator
+    never detects it as an approval and no Teams card is ever sent - the LLM
+    only sees the id in its own text reply, exactly as observed in testing
+    (2026-09-28)."""
+
+    id: str
+    status: str
+    message: str
+    payload: dict[str, str] = Field(default_factory=dict)
+
+
+class ApprovalStatusDTO(BaseModel):
+    id: str
+    status: str
+    resource_id: str
+    payload: dict[str, str] = Field(default_factory=dict)
