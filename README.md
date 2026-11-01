@@ -99,12 +99,13 @@ Needs, once, in the GCP project:
 gcloud storage buckets create gs://$PROJECT_ID-terbox-erp-mcp-var --location=europe-west3
 gcloud storage buckets add-iam-policy-binding gs://$PROJECT_ID-terbox-erp-mcp-var \
   --member=serviceAccount:terbox-erp-mcp-run@$PROJECT_ID.iam.gserviceaccount.com --role=roles/storage.objectUser
-printf '%s' "$ODOO_API_KEY" | gcloud secrets create terbox-erp-mcp-odoo-api-key --data-file=-
-gcloud secrets add-iam-policy-binding terbox-erp-mcp-odoo-api-key \
+gcloud secrets add-iam-policy-binding odoo_api_key \
   --member=serviceAccount:terbox-erp-mcp-run@$PROJECT_ID.iam.gserviceaccount.com --role=roles/secretmanager.secretAccessor
 ```
 
 Odoo caps API key lifetime at 3 months, so the key needs rotating before expiry.
+`odoo_api_key` is shared with the CAD Backend and its user has broad rights; this
+server should get its own secret with a key of a dedicated, minimal Odoo user.
 
 Locally:
 
