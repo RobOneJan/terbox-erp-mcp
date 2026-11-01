@@ -33,6 +33,7 @@ tool. There is no generic write.
 | `odoo_anhang_ablegen` | Files on an invoice, order, partner or product. |
 | `odoo_material_anlegen` | New article, optionally with supplier and price. |
 | `odoo_einkaufspreis_aendern` | Changes one stored supplier price. |
+| `odoo_verkaufspreis_aendern` | Changes an article's list price. Existing quotes keep theirs. |
 
 A prepare tool returns a pending approval, which agent-hub turns into a Teams
 card. The human can correct any field on the card, then approving calls

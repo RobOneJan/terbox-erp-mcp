@@ -322,7 +322,7 @@ class OdooClient:
 
     def find_product_template(self, default_code: str) -> dict | None:
         rows = self.search_read(
-            "product.template", [["default_code", "=", default_code]], ["name", "default_code"], limit=1
+            "product.template", [["default_code", "=", default_code]], ["name", "default_code", "list_price"], limit=1
         )
         return rows[0] if rows else None
 
@@ -455,3 +455,6 @@ class OdooClient:
 
     def set_supplier_price(self, supplierinfo_id: int, price: float) -> None:
         self._call("product.supplierinfo", "write", ids=[supplierinfo_id], vals={"price": price})
+
+    def set_sales_price(self, tmpl_id: int, price: float) -> None:
+        self._call("product.template", "write", ids=[tmpl_id], vals={"list_price": price})

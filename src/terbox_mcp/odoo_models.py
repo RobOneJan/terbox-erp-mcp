@@ -53,7 +53,13 @@ def safe_filename(value: str) -> str:
 
 class Anhang(BaseModel):
     dateiname: str = Field(min_length=1, max_length=200)
-    inhalt_base64: str = Field(min_length=1)
+    inhalt_base64: str = Field(
+        min_length=1,
+        description=(
+            "The file. When a tool result gave you an attachment_ref (e.g. from an email "
+            "attachment), pass that attachment_ref here unchanged; agent-hub supplies the content."
+        ),
+    )
 
     @field_validator("dateiname")
     @classmethod
@@ -179,6 +185,11 @@ class MaterialRequest(BaseModel):
         if self.lieferant_id is None and (self.einkaufspreis is not None or self.lieferanten_artikelnummer):
             raise ValueError("einkaufspreis and lieferanten_artikelnummer need a lieferant_id")
         return self
+
+
+class VerkaufspreisRequest(BaseModel):
+    artikel_referenz: str = Field(min_length=1, description="Internal reference (default_code), e.g. 'P00001'.")
+    neuer_preis: float = Field(ge=0, description="New net sales price.")
 
 
 class EinkaufspreisRequest(BaseModel):

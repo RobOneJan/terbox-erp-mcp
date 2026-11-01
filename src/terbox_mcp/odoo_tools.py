@@ -31,6 +31,7 @@ from terbox_mcp.odoo_models import (
     EinkaufspreisRequest,
     MaterialRequest,
     PreisPruefPosition,
+    VerkaufspreisRequest,
     safe_filename,
     sniff_content_type,
 )
@@ -424,6 +425,32 @@ def odoo_einkaufspreis_aendern(ctx: Context, aenderung: EinkaufspreisRequest) ->
     return _pending_response(request, f"Einkaufspreis von {resource_id}: {current} → {aenderung.neuer_preis} ändern?")
 
 
+@mcp.tool()
+def odoo_verkaufspreis_aendern(ctx: Context, aenderung: VerkaufspreisRequest) -> PendingApprovalDTO:
+    """Request human approval to change an article's net sales price (list price)
+    in Odoo. Writes nothing yet. Existing quotes and orders keep their prices. Once
+    approved, call odoo_verkaufspreis_aendern_execute."""
+    article = _odoo().find_product_template(aenderung.artikel_referenz)
+    if article is None:
+        raise OdooError(404, f"article {aenderung.artikel_referenz!r} not found")
+    current = float(article.get("list_price") or 0.0)
+    data = {
+        "artikel_referenz": aenderung.artikel_referenz,
+        "artikel": article["name"],
+        "alter_preis": current,
+        "neuer_preis": aenderung.neuer_preis,
+    }
+    resource_id = f"{aenderung.artikel_referenz} {article['name']}"
+    request = approvals.create(
+        _resolve_tenant_id(ctx),
+        action="odoo_verkaufspreis_aendern",
+        resource_id=resource_id,
+        data=data,
+        ttl=ODOO_APPROVAL_TTL,
+    )
+    return _pending_response(request, f"Verkaufspreis von {resource_id}: {current} → {aenderung.neuer_preis} ändern?")
+
+
 # --- writes: execute (each consumes its approval first, so it can never run twice) ---
 
 
@@ -600,3 +627,31 @@ def odoo_einkaufspreis_aendern_execute(ctx: Context, approval_id: str) -> dict:
         "alter_preis": expected,
         "neuer_preis": aenderung.neuer_preis,
     }
+
+
+@mcp.tool()
+def odoo_verkaufspreis_aendern_execute(ctx: Context, approval_id: str) -> dict:
+    """Apply an approved odoo_verkaufspreis_aendern request. Fails unless a human
+    has approved it; each approval works once. Refuses if the stored price changed
+    after the request was made, since the human approved a change from the old
+    value."""
+    try:
+        approval = approvals.consume_approved(approval_id, _resolve_tenant_id(ctx), "odoo_verkaufspreis_aendern")
+    except (approvals.ApprovalNotFoundError, approvals.ApprovalStateError) as exc:
+        return _approval_error(exc, approval_id)
+    try:
+        aenderung = VerkaufspreisRequest.model_validate(approval.data)
+    except ValidationError as exc:
+        return _invalid(exc)
+    client = _odoo()
+    try:
+        article = client.find_product_template(aenderung.artikel_referenz)
+        if article is None:
+            raise OdooError(404, f"article {aenderung.artikel_referenz!r} not found")
+        expected = float(approval.data["alter_preis"])
+        if abs((article.get("list_price") or 0.0) - expected) > 1e-6:
+            raise OdooError(409, f"price is now {article.get('list_price')}, approval was for a change from {expected}")
+        client.set_sales_price(article["id"], aenderung.neuer_preis)
+    except OdooError as exc:
+        return _error(exc)
+    return {"artikel_id": article["id"], "alter_preis": expected, "neuer_preis": aenderung.neuer_preis}

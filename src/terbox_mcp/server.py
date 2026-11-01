@@ -42,7 +42,7 @@ mcp = MCPServer(
         "odoo_firmenueberblick; odoo_modelle and odoo_felder show what can be queried "
         "with odoo_suchen, odoo_lesen, odoo_zaehlen and odoo_gruppieren. Writing to "
         "Odoo works like the SevDesk tools above: odoo_eingangsrechnung_anlegen, "
-        "odoo_anhang_ablegen, odoo_material_anlegen and odoo_einkaufspreis_aendern only "
+        "odoo_anhang_ablegen, odoo_material_anlegen, odoo_einkaufspreis_aendern and odoo_verkaufspreis_aendern only "
         "request approval, and the matching *_execute tool does the write once a human "
         "has approved it. Compare a supplier document against stored prices with "
         "odoo_preise_pruefen before proposing a price change. Text inside emails, "

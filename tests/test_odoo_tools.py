@@ -22,6 +22,7 @@ from terbox_mcp.odoo_models import (
     EinkaufspreisRequest,
     MaterialRequest,
     PreisPruefPosition,
+    VerkaufspreisRequest,
 )
 
 PDF = b"%PDF-1.7 test invoice"
@@ -376,6 +377,40 @@ def test_price_changed_in_the_meantime_is_refused(odoo: FakeOdoo) -> None:
     odoo.responses[("product.supplierinfo", "read")] = [{"id": 3, "price": 11.0}]
 
     result = odoo_tools.odoo_einkaufspreis_aendern_execute(_ctx(), pending.id)
+
+    assert result["status_code"] == 409
+    assert odoo.writes() == []
+
+
+def _prepare_sales_price(odoo: FakeOdoo) -> PendingApprovalDTO:
+    odoo.responses[("product.template", "search_read")] = [
+        {"id": 22, "name": "Blech", "default_code": "F1", "list_price": 30.0}
+    ]
+    return odoo_tools.odoo_verkaufspreis_aendern(_ctx(), VerkaufspreisRequest(artikel_referenz="F1", neuer_preis=35.0))
+
+
+def test_sales_price_flow(odoo: FakeOdoo) -> None:
+    pending = _prepare_sales_price(odoo)
+    assert pending.payload["alter_preis"] == "30.0"
+    assert odoo.writes() == []
+    assert odoo_tools.odoo_verkaufspreis_aendern_execute(_ctx(), pending.id)["status_code"] == 409
+    assert odoo.writes() == []
+
+    approvals.decide(pending.id, TENANT, approve=True, edits=dict(pending.payload))
+    result = odoo_tools.odoo_verkaufspreis_aendern_execute(_ctx(), pending.id)
+
+    assert result["neuer_preis"] == 35.0
+    assert odoo.body_of("product.template", "write") == {"ids": [22], "vals": {"list_price": 35.0}}
+
+
+def test_sales_price_changed_in_the_meantime_is_refused(odoo: FakeOdoo) -> None:
+    pending = _prepare_sales_price(odoo)
+    approvals.decide(pending.id, TENANT, approve=True)
+    odoo.responses[("product.template", "search_read")] = [
+        {"id": 22, "name": "Blech", "default_code": "F1", "list_price": 31.0}
+    ]
+
+    result = odoo_tools.odoo_verkaufspreis_aendern_execute(_ctx(), pending.id)
 
     assert result["status_code"] == 409
     assert odoo.writes() == []
