@@ -1,10 +1,49 @@
 # terbox-erp-mcp
 
 MCP server exposing the TER BOX CAD Backend API (AB1000 box configuration,
-customer creation and quoting) as agent tools. Intended to later be driven
-from a Telegram bot and a scheduler.
+customer creation and quoting) and Odoo as agent tools, driven through
+`agent-hub` (Teams, Telegram). agent-hub already reaches this server as
+`terbox`, so new tools need no change there.
 
-## Tools
+## Odoo tools
+
+Talks directly to Odoo's JSON-2 API (`odoo_client.py`), not through the CAD
+Backend.
+
+**Reading** runs immediately and covers every model:
+
+- `odoo_firmenueberblick` — open/overdue invoices, orders, master data gaps.
+- `odoo_modelle`, `odoo_felder` — discover what can be queried.
+- `odoo_suchen`, `odoo_lesen`, `odoo_zaehlen`, `odoo_gruppieren`,
+  `odoo_namen_suchen` — generic reads on any model.
+- `odoo_anhang_lesen` — fetch a stored file.
+- `odoo_preise_pruefen` — compare a supplier document with stored prices.
+
+Credentials and security models (`DENIED_MODELS`) and secret or binary fields
+(`DENIED_FIELDS`) are refused before a request leaves this server, including
+when used only in a domain filter, grouping or sort order. Custom read methods
+on individual models are not exposed, only the generic ones (`READ_METHODS`).
+
+**Writing** is limited to these actions, each a prepare tool plus an `_execute`
+tool. There is no generic write.
+
+| Prepare tool | Effect after approval |
+| --- | --- |
+| `odoo_eingangsrechnung_anlegen` | Draft vendor bill with files, plus the supplier if new. Never posted. |
+| `odoo_anhang_ablegen` | Files on an invoice, order, partner or product. |
+| `odoo_material_anlegen` | New article, optionally with supplier and price. |
+| `odoo_einkaufspreis_aendern` | Changes one stored supplier price. |
+
+A prepare tool returns a pending approval, which agent-hub turns into a Teams
+card. The human can correct any field on the card, then approving calls
+`/internal/approvals/{id}/approve`, a route the LLM cannot reach. agent-hub
+then resumes the conversation and the agent calls the `_execute` tool, which
+works once per approval. `odoo_freigabe_status` shows where a request stands.
+
+File contents are kept apart from the reviewable fields, so the card shows name
+and size only. Every upload is verified against Odoo's checksum afterwards.
+
+## AB1000 tools
 
 - `ab1000_preview` — preview a box configuration.
 - `ab1000_bom_xlsx` — generate a bill-of-materials Excel file (saved locally,
@@ -19,7 +58,7 @@ from a Telegram bot and a scheduler.
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-cp .env.example .env  # fill in TERBOX_API_BASE_URL and TERBOX_API_KEY
+cp .env.example .env  # fill in the TER BOX and Odoo settings
 ```
 
 ## Run
@@ -52,6 +91,19 @@ endpoint at `/mcp`, listening on `$PORT` — matching the `agent-hub` /
 `email-mcp-server` setup in the same GCP project. `Dockerfile` builds the
 image; `cloudbuild.yaml` builds, pushes to Artifact Registry and deploys to
 Cloud Run via a Cloud Build trigger on pushes to `main`.
+
+Needs, once, in the GCP project:
+
+```bash
+gcloud storage buckets create gs://$PROJECT_ID-terbox-erp-mcp-var --location=europe-west3
+gcloud storage buckets add-iam-policy-binding gs://$PROJECT_ID-terbox-erp-mcp-var \
+  --member=serviceAccount:terbox-erp-mcp-run@$PROJECT_ID.iam.gserviceaccount.com --role=roles/storage.objectUser
+printf '%s' "$ODOO_API_KEY" | gcloud secrets create terbox-erp-mcp-odoo-api-key --data-file=-
+gcloud secrets add-iam-policy-binding terbox-erp-mcp-odoo-api-key \
+  --member=serviceAccount:terbox-erp-mcp-run@$PROJECT_ID.iam.gserviceaccount.com --role=roles/secretmanager.secretAccessor
+```
+
+Odoo caps API key lifetime at 3 months, so the key needs rotating before expiry.
 
 Locally:
 

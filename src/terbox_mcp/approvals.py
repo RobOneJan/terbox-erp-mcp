@@ -18,14 +18,24 @@ matching "execute" tool (`ab1000_kunde_execute`,
 `ab1000_angebot_konfiguration_execute`) consume the approval and perform the
 actual SevDesk write - and it can do so only once: `consume_approved` marks
 the request CONSUMED so it can never be replayed into a second write.
+
+The same gate also covers the Odoo write tools (`odoo_tools.py`). Those differ in
+two ways: they carry file contents, kept in `blobs` so they never reach the
+reviewable `payload` that agent-hub renders as a Teams card; and a human may answer
+hours after an email arrived, which is why they use a longer ttl and why
+`APPROVAL_STORE_DIR` (a mounted volume in production, same stopgap as
+email-mcp-server's) can make requests survive this server scaling to zero.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 DEFAULT_TENANT_ID = "default"
@@ -76,15 +86,88 @@ class ApprovalRequest:
     payload: dict[str, str]
     created_at: datetime
     expires_at: datetime
+    blobs: list[bytes] = field(default_factory=list)
 
 
-# Single-process, in-memory store - same complexity level as the rest of this
-# server (no database, no file-backed persistence). A restart drops any
-# pending approvals, which is acceptable: the LLM re-runs the prepare tool.
+# Single-process store. In memory only unless APPROVAL_STORE_DIR is set; without
+# it a restart drops any pending approvals and the LLM re-runs the prepare tool.
 _store: dict[str, ApprovalRequest] = {}
 
 
-def create(tenant_id: str, action: str, resource_id: str, data: dict[str, Any]) -> ApprovalRequest:
+def _store_dir() -> Path | None:
+    configured = os.environ.get("APPROVAL_STORE_DIR")
+    return Path(configured) if configured else None
+
+
+def _persist(request: ApprovalRequest) -> None:
+    directory = _store_dir()
+    if directory is None:
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+    for index, blob in enumerate(request.blobs):
+        (directory / f"{request.id}.{index}.bin").write_bytes(blob)
+    record = {
+        "id": request.id,
+        "tenant_id": request.tenant_id,
+        "action": request.action,
+        "resource_id": request.resource_id,
+        "status": request.status,
+        "data": request.data,
+        "created_at": request.created_at.isoformat(),
+        "expires_at": request.expires_at.isoformat(),
+        "blob_count": len(request.blobs),
+    }
+    (directory / f"{request.id}.json").write_text(json.dumps(record))
+
+
+def _load(approval_id: str) -> ApprovalRequest | None:
+    directory = _store_dir()
+    if directory is None:
+        return None
+    try:
+        # The id comes from the caller and ends up in a path.
+        normalized = str(uuid.UUID(approval_id))
+    except ValueError:
+        return None
+    path = directory / f"{normalized}.json"
+    if not path.exists():
+        return None
+    record = json.loads(path.read_text())
+    request = ApprovalRequest(
+        id=record["id"],
+        tenant_id=record["tenant_id"],
+        action=record["action"],
+        resource_id=record["resource_id"],
+        status=record["status"],
+        data=record["data"],
+        payload=_flatten(record["data"]),
+        created_at=datetime.fromisoformat(record["created_at"]),
+        expires_at=datetime.fromisoformat(record["expires_at"]),
+        blobs=[(directory / f"{normalized}.{i}.bin").read_bytes() for i in range(record["blob_count"])],
+    )
+    _store[request.id] = request
+    return request
+
+
+def discard_blobs(request: ApprovalRequest) -> None:
+    """Drop file contents once a request can no longer need them."""
+    directory = _store_dir()
+    if directory is not None:
+        for index in range(len(request.blobs)):
+            (directory / f"{request.id}.{index}.bin").unlink(missing_ok=True)
+    request.blobs = []
+    _persist(request)
+
+
+def create(
+    tenant_id: str,
+    action: str,
+    resource_id: str,
+    data: dict[str, Any],
+    *,
+    blobs: list[bytes] | None = None,
+    ttl: timedelta = DEFAULT_TTL,
+) -> ApprovalRequest:
     """Store `data` (a validated model's `model_dump(exclude_none=True)`) as a
     new PENDING approval and return it. `payload` is derived from `data` via
     `_flatten` so a human can review every field, however nested."""
@@ -98,9 +181,11 @@ def create(tenant_id: str, action: str, resource_id: str, data: dict[str, Any]) 
         data=data,
         payload=_flatten(data),
         created_at=now,
-        expires_at=now + DEFAULT_TTL,
+        expires_at=now + ttl,
+        blobs=blobs or [],
     )
     _store[request.id] = request
+    _persist(request)
     return request
 
 
@@ -108,7 +193,7 @@ def get(approval_id: str, tenant_id: str) -> ApprovalRequest:
     """Raises ApprovalNotFoundError if `approval_id` is unknown or belongs to
     a different tenant than `tenant_id` - both look identical to the caller,
     on purpose, so this never leaks whether an id exists for someone else."""
-    request = _store.get(approval_id)
+    request = _store.get(approval_id) or _load(approval_id)
     if request is None or request.tenant_id != tenant_id:
         raise ApprovalNotFoundError(approval_id)
     return _resolve_expiry(request)
@@ -137,6 +222,10 @@ def decide(
     if approve and edits:
         _apply_edits(request, edits)
     request.status = ApprovalStatus.APPROVED if approve else ApprovalStatus.REJECTED
+    if approve:
+        _persist(request)
+    else:
+        discard_blobs(request)
     return request
 
 
@@ -158,6 +247,7 @@ def consume_approved(approval_id: str, tenant_id: str, action: str) -> ApprovalR
     if request.status != ApprovalStatus.APPROVED:
         raise ApprovalStateError(f"approval {approval_id} is {request.status}, not approved")
     request.status = ApprovalStatus.CONSUMED
+    _persist(request)
     return request
 
 
@@ -167,6 +257,7 @@ def _resolve_expiry(request: ApprovalRequest) -> ApprovalRequest:
         and datetime.now(timezone.utc) > request.expires_at
     ):
         request.status = ApprovalStatus.EXPIRED
+        discard_blobs(request)
     return request
 
 

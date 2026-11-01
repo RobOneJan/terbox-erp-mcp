@@ -126,4 +126,5 @@ class ApprovalStatusDTO(BaseModel):
     id: str
     status: str
     resource_id: str
+    action: str = ""
     payload: dict[str, str] = Field(default_factory=dict)

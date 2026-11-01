@@ -27,8 +27,13 @@ steps:
       - --no-allow-unauthenticated
       - --max-instances=1
       - --service-account=${_SERVICE}-run@${PROJECT_ID}.iam.gserviceaccount.com
-      - --set-env-vars=TERBOX_API_BASE_URL=https://terbox-cad-backend-1094405818622.europe-west3.run.app
-      - --set-secrets=TERBOX_API_KEY=terboxapikey:latest
+      # GCS-backed volume so a pending approval (and its PDF) survives scaling to
+      # zero while a human hasn't answered yet. Same stopgap as email-mcp-server:
+      # single-instance only (--max-instances=1 above).
+      - --add-volume=name=var,type=cloud-storage,bucket=${PROJECT_ID}-terbox-erp-mcp-var
+      - --add-volume-mount=volume=var,mount-path=/app/var
+      - --set-env-vars=TERBOX_API_BASE_URL=https://terbox-cad-backend-1094405818622.europe-west3.run.app,ODOO_URL=https://ter-box.odoo.com,ODOO_DB=ter-box,APPROVAL_STORE_DIR=/app/var/approvals
+      - --set-secrets=TERBOX_API_KEY=terboxapikey:latest,ODOO_API_KEY=terbox-erp-mcp-odoo-api-key:latest
 
 images:
   - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${BUILD_ID}
