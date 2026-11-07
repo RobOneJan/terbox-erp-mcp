@@ -114,6 +114,7 @@ def _rechnung(**overrides) -> RechnungAblageRequest:
         "lieferant_name": "Zaunbau Müller",
         "rechnungsnummer": "RE-1",
         "rechnungsdatum": "2026-10-20",
+        "faelligkeitsdatum": "2026-11-03",
         "betraege": [{"netto": 3096.0, "steuer_prozent": 19}],
         "anhaenge": [{"dateiname": "re-1.pdf", "inhalt_base64": PDF_B64}],
     }
@@ -214,7 +215,7 @@ def test_invoice_of_known_supplier_is_stored_as_draft_and_one_card_asks_to_book_
 
     assert result["ergebnis"] == "abgelegt"
     assert result["status"] == "pending"
-    assert result["message"] == "Rechnung RE-1 von Zaunbau Müller GmbH über 3.684,24 € buchen?"
+    assert result["message"] == "Rechnung RE-1 von Zaunbau Müller GmbH über 3.684,24 € (fällig 03.11.2026) buchen?"
     assert "als Entwurf abgelegt, Buchung angefragt" in result["meldung"]
     vals = odoo.body_of("account.move", "create")["vals_list"][0]
     assert vals["move_type"] == "in_invoice"
@@ -232,6 +233,38 @@ def test_invoice_of_known_supplier_is_stored_as_draft_and_one_card_asks_to_book_
     # The card can correct number, dates and cost type - never which bill it is.
     assert set(result["payload"]) == {"rechnungsnummer", "rechnungsdatum", "faelligkeitsdatum", "kostenart"}
     assert approvals.get(result["id"], TENANT).resource_id == str(result["rechnung_id"])
+
+
+def test_due_date_is_required_and_never_before_the_invoice_date() -> None:
+    values = {
+        "lieferant_name": "X",
+        "rechnungsnummer": "1",
+        "rechnungsdatum": "2026-10-20",
+        "betraege": [{"netto": 1}],
+        "anhaenge": [{"dateiname": "a.pdf", "inhalt_base64": PDF_B64}],
+    }
+    with pytest.raises(ValueError, match="faelligkeitsdatum"):
+        RechnungAblageRequest(**values)
+    with pytest.raises(ValueError, match="before rechnungsdatum"):
+        RechnungAblageRequest(**values, faelligkeitsdatum="2026-10-19")
+
+
+def test_direct_debit_is_noted_on_the_bill_and_in_the_message(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+
+    result = _ablegen(_rechnung(lastschrift=True))
+
+    vals = odoo.body_of("account.move", "create")["vals_list"][0]
+    assert vals["invoice_date_due"] == "2026-11-03"
+    assert "nicht überweisen" in vals["narration"]
+    assert "per Lastschrift - nicht überweisen" in result["meldung"]
+    assert "per Lastschrift" in result["message"]
+
+
+def test_bill_without_direct_debit_has_no_note(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    _ablegen(_rechnung())
+    assert "narration" not in odoo.body_of("account.move", "create")["vals_list"][0]
 
 
 def _bill_in_odoo(odoo: FakeOdoo, **fields) -> None:
@@ -966,6 +999,7 @@ async def test_booking_card_is_detectable_by_agent_hub(odoo: FakeOdoo) -> None:
                 "lieferant_name": "Zaunbau Müller",
                 "rechnungsnummer": "RE-1",
                 "rechnungsdatum": "2026-10-20",
+                "faelligkeitsdatum": "2026-11-03",
                 "betraege": [{"netto": 100}],
                 "anhaenge": [{"dateiname": "a.pdf", "inhalt_base64": PDF_B64}],
             }

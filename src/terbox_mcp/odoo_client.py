@@ -528,6 +528,7 @@ class OdooClient:
         faelligkeitsdatum: str | None,
         waehrung: str,
         lines: list[dict],
+        notiz: str | None = None,
     ) -> int:
         currency_id = self.resolve_by_name("res.currency", "name", waehrung)
         return self._create(
@@ -541,6 +542,7 @@ class OdooClient:
                     "invoice_date_due": faelligkeitsdatum,
                     "currency_id": currency_id,
                     "invoice_line_ids": [[0, 0, line] for line in lines] or None,
+                    "narration": notiz,
                 }
             ),
         )

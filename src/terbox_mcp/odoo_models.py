@@ -135,7 +135,17 @@ class RechnungAblageRequest(BaseModel):
     ust_id: Optional[str] = Field(default=None, description="Supplier VAT id as printed on the invoice.")
     rechnungsnummer: str = Field(min_length=1, description="The supplier's own invoice number.")
     rechnungsdatum: date
-    faelligkeitsdatum: Optional[date] = None
+    faelligkeitsdatum: date = Field(
+        description=(
+            "Due date as stated on the invoice. If it only gives a period ('zahlbar innerhalb 14 "
+            "Tagen'), add it to rechnungsdatum; if it states none, use rechnungsdatum. Never today's "
+            "date unless the invoice says so."
+        )
+    )
+    lastschrift: bool = Field(
+        default=False,
+        description="True if the supplier collects the amount by direct debit (Lastschrift, Abbuchung, Einzug).",
+    )
     waehrung: str = Field(default="EUR", min_length=3, max_length=3)
     betraege: list[Betrag] = Field(
         default_factory=list,
@@ -170,6 +180,8 @@ class RechnungAblageRequest(BaseModel):
 
     @model_validator(mode="after")
     def _supplier_given(self):
+        if self.faelligkeitsdatum < self.rechnungsdatum:
+            raise ValueError("faelligkeitsdatum lies before rechnungsdatum")
         if self.lieferant_id is None and not (self.lieferant_name or self.ust_id):
             raise ValueError("give lieferant_id, or lieferant_name / ust_id from the invoice")
         _distinct_filenames(self.anhaenge)

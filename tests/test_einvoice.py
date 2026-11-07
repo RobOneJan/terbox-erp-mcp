@@ -50,7 +50,7 @@ CII = """<?xml version="1.0" encoding="UTF-8"?>
     </ram:ApplicableHeaderTradeAgreement>
     <ram:ApplicableHeaderTradeSettlement>
       <ram:InvoiceCurrencyCode>EUR</ram:InvoiceCurrencyCode>
-      <ram:SpecifiedTradeSettlementPaymentMeans><ram:PayeePartyCreditorFinancialAccount><ram:IBANID>DE02120300000000202051</ram:IBANID></ram:PayeePartyCreditorFinancialAccount></ram:SpecifiedTradeSettlementPaymentMeans>
+      <ram:SpecifiedTradeSettlementPaymentMeans><ram:TypeCode>{zahlart}</ram:TypeCode><ram:PayeePartyCreditorFinancialAccount><ram:IBANID>DE02120300000000202051</ram:IBANID></ram:PayeePartyCreditorFinancialAccount></ram:SpecifiedTradeSettlementPaymentMeans>
       <ram:ApplicableTradeTax><ram:BasisAmount>100.00</ram:BasisAmount><ram:CategoryCode>{steuerart}</ram:CategoryCode><ram:RateApplicablePercent>19</ram:RateApplicablePercent></ram:ApplicableTradeTax>
       <ram:SpecifiedTradePaymentTerms><ram:DueDateDateTime><udt:DateTimeString format="102">20261120</udt:DateTimeString></ram:DueDateDateTime></ram:SpecifiedTradePaymentTerms>
       <ram:SpecifiedTradeSettlementHeaderMonetarySummation><ram:GrandTotalAmount>119.00</ram:GrandTotalAmount></ram:SpecifiedTradeSettlementHeaderMonetarySummation>
@@ -80,8 +80,10 @@ UBL = """<?xml version="1.0" encoding="UTF-8"?>
 </Invoice>"""
 
 
-def _cii(nummer: str = "ER-1", typ: str = "380", name: str = "Zaunbau Müller GmbH", steuerart: str = "S") -> bytes:
-    return CII.format(nummer=nummer, typ=typ, name=name, steuerart=steuerart).encode()
+def _cii(
+    nummer: str = "ER-1", typ: str = "380", name: str = "Zaunbau Müller GmbH", steuerart: str = "S", zahlart: str = "58"
+) -> bytes:
+    return CII.format(nummer=nummer, typ=typ, name=name, steuerart=steuerart, zahlart=zahlart).encode()
 
 
 def _pdf_with(xml: bytes | None, name: str = "factur-x.xml") -> bytes:
@@ -135,6 +137,18 @@ def test_reads_xrechnung_ubl_as_plain_xml() -> None:
     assert invoice.positionen[0].einheit == "MTR"
 
 
+def test_recognises_sepa_direct_debit() -> None:
+    assert read_einvoice(_cii(zahlart="59")).lastschrift
+    assert not read_einvoice(_cii(zahlart="58")).lastschrift  # credit transfer
+
+
+def test_direct_debit_in_the_einvoice_is_noted_on_the_bill(odoo: FakeOdoo) -> None:  # noqa: F811
+    _odoo_for_bills(odoo)
+    result = _ablegen(_request(_pdf_with(_cii(zahlart="59"))))
+    assert "nicht überweisen" in odoo.body_of("account.move", "create")["vals_list"][0]["narration"]
+    assert "Lastschrift" in result["meldung"]
+
+
 def test_recognises_a_credit_note() -> None:
     assert read_einvoice(_cii(typ="381")).gutschrift
 
@@ -156,6 +170,7 @@ def _request(content: bytes, **overrides) -> RechnungAblageRequest:
         "lieferant_name": "Zaunbau Müller",
         "rechnungsnummer": "ER-1",
         "rechnungsdatum": "2026-11-06",
+        "faelligkeitsdatum": "2026-11-06",
         "betraege": [{"netto": 99.0}],
         "anhaenge": _anhang(content),
     }
@@ -166,7 +181,7 @@ def test_einvoice_data_wins_over_what_the_agent_read(odoo: FakeOdoo) -> None:  #
     _odoo_for_bills(odoo)
 
     result = _ablegen(
-        _request(_pdf_with(_cii()), rechnungsnummer="ER-l", rechnungsdatum="2026-11-07")
+        _request(_pdf_with(_cii()), rechnungsnummer="ER-l", rechnungsdatum="2026-11-07", faelligkeitsdatum="2026-11-07")
     )
 
     vals = odoo.body_of("account.move", "create")["vals_list"][0]

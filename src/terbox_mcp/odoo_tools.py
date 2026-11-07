@@ -350,7 +350,7 @@ class _Rechnungsdaten:
 
     rechnungsnummer: str
     rechnungsdatum: date
-    faelligkeitsdatum: date | None
+    faelligkeitsdatum: date
     waehrung: str
     lieferant_name: str | None
     ust_id: str | None
@@ -361,6 +361,7 @@ class _Rechnungsdaten:
     positionen: list[dict]
     quelle: str
     hinweise: list[str]
+    lastschrift: bool = False
 
 
 def _rechnungsdaten(rechnung: RechnungAblageRequest) -> _Rechnungsdaten:
@@ -383,6 +384,7 @@ def _rechnungsdaten(rechnung: RechnungAblageRequest) -> _Rechnungsdaten:
             positionen=[],
             quelle="dokument",
             hinweise=[],
+            lastschrift=rechnung.lastschrift,
         )
 
     hinweise = []
@@ -426,6 +428,7 @@ def _rechnungsdaten(rechnung: RechnungAblageRequest) -> _Rechnungsdaten:
         ],
         quelle=f"e-rechnung ({einvoice.format})",
         hinweise=hinweise,
+        lastschrift=einvoice.lastschrift or rechnung.lastschrift,
     )
 
 
@@ -491,6 +494,9 @@ def _betraege(client: OdooClient, daten: _Rechnungsdaten) -> list[dict]:
     return betraege
 
 
+LASTSCHRIFT_NOTIZ = "Wird per SEPA-Lastschrift eingezogen - nicht überweisen."
+
+
 def _store_bill(
     client: OdooClient,
     *,
@@ -502,6 +508,7 @@ def _store_bill(
     betraege: list[dict],
     cost_type: dict | None,
     files: list[tuple[str, bytes]],
+    lastschrift: bool = False,
 ) -> tuple[int, list[dict], list[str]]:
     bill_id = client.create_draft_vendor_bill(
         partner_id=partner_id,
@@ -510,6 +517,7 @@ def _store_bill(
         faelligkeitsdatum=faelligkeitsdatum,
         waehrung=waehrung,
         lines=_bill_lines(client, rechnungsnummer, betraege, cost_type),
+        notiz=LASTSCHRIFT_NOTIZ if lastschrift else None,
     )
     stored, hinweise = [], []
     for filename, blob in files:
@@ -626,6 +634,7 @@ def odoo_rechnung_ablegen(ctx: Context, rechnung: RechnungAblageRequest) -> Rech
                 "lieferant": {key: value for key, value in lieferant.items() if value},
                 **_card_fields(daten, cost_type),
                 "waehrung": daten.waehrung,
+                "lastschrift": daten.lastschrift,
                 "betraege": betraege,
                 "dateinamen": [name for name, _ in files],
             }
@@ -660,11 +669,12 @@ def odoo_rechnung_ablegen(ctx: Context, rechnung: RechnungAblageRequest) -> Rech
             partner_id=partner_id,
             rechnungsnummer=daten.rechnungsnummer,
             rechnungsdatum=daten.rechnungsdatum.isoformat(),
-            faelligkeitsdatum=daten.faelligkeitsdatum.isoformat() if daten.faelligkeitsdatum else None,
+            faelligkeitsdatum=daten.faelligkeitsdatum.isoformat(),
             waehrung=daten.waehrung,
             betraege=betraege,
             cost_type=cost_type,
             files=files,
+            lastschrift=daten.lastschrift,
         )
         hinweise += more
         total = client.bill_total(bill_id)
@@ -674,7 +684,13 @@ def odoo_rechnung_ablegen(ctx: Context, rechnung: RechnungAblageRequest) -> Rech
     filled, differ, iban_warning, more = _enrich_contact(client, partner_id, daten)
     hinweise += more
     amount = _euro(total) if total else gesamt
-    meldung = f"Rechnung {daten.rechnungsnummer} von {supplier['name']} ({amount}) als Entwurf abgelegt, Buchung angefragt."
+    faellig = f"fällig {daten.faelligkeitsdatum:%d.%m.%Y}"
+    if daten.lastschrift:
+        faellig += ", per Lastschrift - nicht überweisen"
+    meldung = (
+        f"Rechnung {daten.rechnungsnummer} von {supplier['name']} ({amount}, {faellig}) "
+        "als Entwurf abgelegt, Buchung angefragt."
+    )
     if filled:
         meldung += f" Beim Lieferanten ergänzt: {_labels(filled)}."
     if iban_warning:
@@ -695,7 +711,7 @@ def odoo_rechnung_ablegen(ctx: Context, rechnung: RechnungAblageRequest) -> Rech
         status="pending",
         ergebnis="abgelegt",
         id=request.id,
-        message=f"Rechnung {daten.rechnungsnummer} von {supplier['name']} über {amount} buchen?",
+        message=f"Rechnung {daten.rechnungsnummer} von {supplier['name']} über {amount} ({faellig}) buchen?",
         payload=request.payload,
         meldung=meldung,
         rechnung_id=bill_id,
@@ -719,7 +735,7 @@ def _card_fields(daten: _Rechnungsdaten, cost_type: dict | None) -> dict:
     return {
         "rechnungsnummer": daten.rechnungsnummer,
         "rechnungsdatum": daten.rechnungsdatum.isoformat(),
-        "faelligkeitsdatum": daten.faelligkeitsdatum.isoformat() if daten.faelligkeitsdatum else "",
+        "faelligkeitsdatum": daten.faelligkeitsdatum.isoformat(),
         "kostenart": cost_type["name"] if cost_type else "",
     }
 
@@ -1285,6 +1301,7 @@ def odoo_rechnung_mit_lieferant_buchen_execute(ctx: Context, approval_id: str) -
                 betraege=betraege,
                 cost_type=cost_type,
                 files=list(zip([safe_filename(n) for n in names], approval.blobs)),
+                lastschrift=str(approval.data.get("lastschrift")).lower() in ("true", "1", "ja"),
             )
         name = client.post_bill(bill_id)
     except (ValidationError, ValueError, KeyError) as exc:

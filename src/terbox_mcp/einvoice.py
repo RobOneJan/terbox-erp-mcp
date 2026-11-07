@@ -43,6 +43,7 @@ _UBL_CREDIT_NOTE = "{urn:oasis:names:specification:ubl:schema:xsd:CreditNote-2}C
 _CII_ROOT = f"{{{_CII['rsm']}}}CrossIndustryInvoice"
 # UNTDID 1001 codes for a credit note (381) and its variants.
 _CREDIT_TYPE_CODES = {"381", "396", "532"}
+_DIRECT_DEBIT_CODES = {"59"}
 
 
 @dataclass
@@ -79,6 +80,8 @@ class ERechnung:
     plz: str | None = None
     ort: str | None = None
     iban: str | None = None
+    # UNTDID 4461 code 59: SEPA direct debit - the supplier collects the amount.
+    lastschrift: bool = False
     brutto: float | None = None
     steuern: list[Steuersumme] = field(default_factory=list)
     positionen: list[Position] = field(default_factory=list)
@@ -176,6 +179,7 @@ def _read_cii(root: ET.Element) -> ERechnung:
         plz=_text(address, "ram:PostcodeCode", ns),
         ort=_text(address, "ram:CityName", ns),
         iban=_text(settlement, "ram:SpecifiedTradeSettlementPaymentMeans/ram:PayeePartyCreditorFinancialAccount/ram:IBANID", ns),
+        lastschrift=_text(settlement, "ram:SpecifiedTradeSettlementPaymentMeans/ram:TypeCode", ns) in _DIRECT_DEBIT_CODES,
         brutto=_number(_text(settlement, "ram:SpecifiedTradeSettlementHeaderMonetarySummation/ram:GrandTotalAmount", ns)),
     )
     if settlement is not None:
@@ -228,6 +232,7 @@ def _read_ubl(root: ET.Element) -> ERechnung:
         plz=_text(address, "cbc:PostalZone", ns),
         ort=_text(address, "cbc:CityName", ns),
         iban=_text(root, "cac:PaymentMeans/cac:PayeeFinancialAccount/cbc:ID", ns),
+        lastschrift=_text(root, "cac:PaymentMeans/cbc:PaymentMeansCode", ns) in _DIRECT_DEBIT_CODES,
         brutto=_number(_text(root, "cac:LegalMonetaryTotal/cbc:PayableAmount", ns)),
     )
     for subtotal in root.findall("cac:TaxTotal/cac:TaxSubtotal", ns):
