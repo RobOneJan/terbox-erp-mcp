@@ -44,14 +44,20 @@ class FakeOdoo:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict]] = []
         self.responses: dict[tuple[str, str], object] = {}
-        self.stored_checksum = hashlib.sha1(PDF).hexdigest()
+        # None: report the checksum of what was actually uploaded, as Odoo does.
+        # A test sets it to simulate an upload Odoo stored corrupted.
+        self.stored_checksum: str | None = None
+        self._last_upload = b""
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         _, _, model, method = request.url.path.strip("/").split("/")
         body = json.loads(request.content or b"{}")
         self.calls.append((model, method, body))
+        if (model, method) == ("ir.attachment", "create"):
+            self._last_upload = base64.b64decode(body["vals_list"][0]["raw"])
         if (model, method) == ("ir.attachment", "read"):
-            return httpx.Response(200, json=[{"id": 900, "checksum": self.stored_checksum}])
+            checksum = self.stored_checksum or hashlib.sha1(self._last_upload).hexdigest()
+            return httpx.Response(200, json=[{"id": 900, "checksum": checksum}])
         answer = self.responses.get((model, method))
         if callable(answer):  # answers that depend on the request, e.g. the domain searched
             answer = answer(body)
@@ -262,7 +268,7 @@ def test_invoice_never_lands_on_a_partner_that_is_not_a_supplier(odoo: FakeOdoo)
 
 def test_same_invoice_twice_is_not_created_again(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
-    odoo.responses[("account.move", "search_read")] = [{"id": 77}]
+    odoo.responses[("account.move", "search_read")] = [{"id": 77, "partner_id": [26, "Zaunbau Müller GmbH"]}]
     odoo.responses[("ir.attachment", "search_read")] = [{"id": 3}]
 
     result = odoo_tools.odoo_rechnung_ablegen(_rechnung())
@@ -272,15 +278,14 @@ def test_same_invoice_twice_is_not_created_again(odoo: FakeOdoo) -> None:
     assert odoo.writes() == []
 
 
-def test_invoice_without_clear_totals_still_stores_the_file(odoo: FakeOdoo) -> None:
+def test_invoice_is_never_stored_without_its_amounts(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
-    odoo.responses[("account.move", "read")] = [{"id": 1, "amount_total": 0.0}]
 
     result = odoo_tools.odoo_rechnung_ablegen(_rechnung(betraege=[]))
 
-    assert "invoice_line_ids" not in odoo.body_of("account.move", "create")["vals_list"][0]
-    assert ("ir.attachment", "create") in odoo.writes()
-    assert "€" not in result["meldung"]
+    assert result["status_code"] == 422
+    assert "betraege" in result["error"]
+    assert odoo.writes() == []
 
 
 def test_reverse_charge_tax_is_used_when_named(odoo: FakeOdoo) -> None:
@@ -671,6 +676,65 @@ def test_price_check_statuses(odoo: FakeOdoo) -> None:
     assert odoo.writes() == []
 
 
+def _supplier_prices(odoo: FakeOdoo, prices: dict[int, float]) -> None:
+    def read(body: dict) -> list[dict]:
+        return [
+            {"id": i, "partner_id": [26, "JTK"], "product_tmpl_id": [i, f"Artikel {i}"], "price": prices[i]}
+            for i in body["ids"]
+            if i in prices
+        ]
+
+    odoo.responses[("product.supplierinfo", "read")] = read
+
+
+def test_several_price_changes_need_one_approval(odoo: FakeOdoo) -> None:
+    prices = {3: 10.0, 4: 0.0}
+    _supplier_prices(odoo, prices)
+
+    pending = odoo_tools.odoo_einkaufspreise_aendern(
+        _ctx(),
+        [EinkaufspreisRequest(lieferantenpreis_id=3, neuer_preis=12.5), EinkaufspreisRequest(lieferantenpreis_id=4, neuer_preis=7)],
+    )
+
+    assert pending.status == "pending"
+    assert "2 Artikel(n) bei JTK" in pending.message
+    assert pending.payload["preise[1].alter_preis"] == "0.0"
+    assert odoo.writes() == []
+    assert odoo_tools.odoo_einkaufspreise_aendern_execute(_ctx(), pending.id)["status_code"] == 409
+
+    approvals.decide(pending.id, TENANT, approve=True, edits=dict(pending.payload))
+    result = odoo_tools.odoo_einkaufspreise_aendern_execute(_ctx(), pending.id)
+
+    assert [g["neuer_preis"] for g in result["geaendert"]] == [12.5, 7.0]
+    writes = [body for m, name, body in odoo.calls if (m, name) == ("product.supplierinfo", "write")]
+    assert writes == [{"ids": [3], "vals": {"price": 12.5}}, {"ids": [4], "vals": {"price": 7.0}}]
+    assert odoo_tools.odoo_einkaufspreise_aendern_execute(_ctx(), pending.id)["status_code"] == 409
+
+
+def test_batch_skips_changed_and_cleared_prices_but_applies_the_rest(odoo: FakeOdoo) -> None:
+    prices = {3: 10.0, 4: 5.0, 5: 1.0}
+    _supplier_prices(odoo, prices)
+    pending = odoo_tools.odoo_einkaufspreise_aendern(
+        _ctx(),
+        [EinkaufspreisRequest(lieferantenpreis_id=i, neuer_preis=20) for i in (3, 4, 5)],
+    )
+    approvals.decide(pending.id, TENANT, approve=True, edits={"preise[1].neuer_preis": ""})
+    prices[5] = 2.0  # changed in Odoo meanwhile
+
+    result = odoo_tools.odoo_einkaufspreise_aendern_execute(_ctx(), pending.id)
+
+    assert [g["artikel"] for g in result["geaendert"]] == ["Artikel 3"]
+    assert {u["artikel"]: u["grund"] for u in result["uebersprungen"]} == {
+        "Artikel 4": "kein neuer Preis",
+        "Artikel 5": "Preis inzwischen 2.0",
+    }
+
+
+def test_batch_needs_one_to_thirty_changes(odoo: FakeOdoo) -> None:
+    with pytest.raises(OdooError):
+        odoo_tools.odoo_einkaufspreise_aendern(_ctx(), [])
+
+
 # --- persistence across a restart --------------------------------------------
 
 
@@ -734,6 +798,7 @@ async def test_invoice_result_reaches_agent_hub_as_plain_text_not_an_approval(od
                 "lieferant_name": "Zaunbau Müller",
                 "rechnungsnummer": "RE-1",
                 "rechnungsdatum": "2026-10-20",
+                "betraege": [{"netto": 100}],
                 "anhaenge": [{"dateiname": "a.pdf", "inhalt_base64": PDF_B64}],
             }
         },

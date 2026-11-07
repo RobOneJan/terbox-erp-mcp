@@ -26,8 +26,18 @@ on individual models are not exposed, only the generic ones (`READ_METHODS`).
 
 **Supplier invoices** go to `odoo_rechnung_ablegen` without approval: it finds
 the supplier from name or VAT id and stores a draft bill with the PDF and one
-total line per tax rate, never the individual items, and never posts it. Only
-known suppliers qualify. For an unknown one the agent asks for approval to
+total line per tax rate, never the individual items, and never posts it. It is
+never stored without amounts. It first checks whether the invoice number is
+already in Odoo for any supplier. An optional product category sets the line's
+expense account from that category. Only known suppliers qualify.
+
+For e-invoices (ZUGFeRD / Factur-X / XRechnung, embedded in the PDF or as an XML
+file; see `einvoice.py`) the data in the file wins over what the agent read:
+number, dates, totals per tax rate, VAT id, contact details and IBAN. Its items
+come back so the agent can compare them with stored prices
+(`odoo_preise_pruefen`) and request all changes on one card
+(`odoo_einkaufspreise_aendern`). Odoo's own e-invoice import is not used: it
+creates every item line and stores the invoice's IBAN as a bank account. For an unknown one the agent asks for approval to
 create it (`odoo_lieferant_anlegen`), then stores the invoice. Repeating it for
 the same invoice creates nothing twice.
 
@@ -48,6 +58,7 @@ There is no generic write.
 | `odoo_anhang_ablegen` | Files on an invoice, order, partner or product. |
 | `odoo_material_anlegen` | New article, optionally with supplier and price. |
 | `odoo_einkaufspreis_aendern` | Changes one stored supplier price. |
+| `odoo_einkaufspreise_aendern` | Changes several supplier prices on one card. |
 | `odoo_verkaufspreis_aendern` | Changes an article's list price. Existing quotes keep theirs. |
 
 A prepare tool returns a pending approval, which agent-hub turns into a Teams

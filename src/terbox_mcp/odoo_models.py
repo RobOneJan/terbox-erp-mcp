@@ -153,6 +153,10 @@ class RechnungAblageRequest(BaseModel):
         default=None,
         description="IBAN printed on the invoice. Only compared with Odoo, never stored.",
     )
+    kategorie: Optional[str] = Field(
+        default=None,
+        description="Odoo product category for the kind of expense, e.g. 'Werkzeuge' or 'Marketing'.",
+    )
 
     @field_validator("waehrung")
     @classmethod

@@ -14,6 +14,7 @@ model's docstring). `odoo_anhang_lesen` is bare for the same reason.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
@@ -21,6 +22,7 @@ from mcp.server.mcpserver import Context
 from pydantic import ValidationError
 
 from terbox_mcp import approvals
+from terbox_mcp.einvoice import read_einvoice
 from terbox_mcp.models import ApprovalStatusDTO, PendingApprovalDTO
 from terbox_mcp.odoo_client import DEFAULT_LIMIT, SUPPLIER_CONTACT_FIELDS, OdooClient, OdooError
 from terbox_mcp.odoo_models import (
@@ -341,83 +343,212 @@ def _euro(amount: float) -> str:
     return f"{amount:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+@dataclass
+class _Rechnungsdaten:
+    """What goes into the bill: the e-invoice's data where the file has it, the
+    agent's reading otherwise."""
+
+    rechnungsnummer: str
+    rechnungsdatum: date
+    faelligkeitsdatum: date | None
+    waehrung: str
+    lieferant_name: str | None
+    ust_id: str | None
+    kontakt: dict[str, str | None]
+    iban: str | None
+    # (net, percent, exact Odoo tax name or None, whether Odoo's tax can be chosen)
+    summen: list[tuple[float, float, str | None, bool]]
+    positionen: list[dict]
+    quelle: str
+    hinweise: list[str]
+
+
+def _rechnungsdaten(rechnung: RechnungAblageRequest) -> _Rechnungsdaten:
+    agent_kontakt = rechnung.kontakt.model_dump() if rechnung.kontakt else {}
+    agent_summen = [(b.netto, b.steuer_prozent, b.steuer_name, True) for b in rechnung.betraege]
+    einvoice = next(
+        (found for found in (read_einvoice(anhang.raw()) for anhang in rechnung.anhaenge) if found), None
+    )
+    if einvoice is None or not einvoice.rechnungsnummer:
+        return _Rechnungsdaten(
+            rechnungsnummer=rechnung.rechnungsnummer,
+            rechnungsdatum=rechnung.rechnungsdatum,
+            faelligkeitsdatum=rechnung.faelligkeitsdatum,
+            waehrung=rechnung.waehrung,
+            lieferant_name=rechnung.lieferant_name,
+            ust_id=rechnung.ust_id,
+            kontakt=agent_kontakt,
+            iban=rechnung.iban,
+            summen=agent_summen,
+            positionen=[],
+            quelle="dokument",
+            hinweise=[],
+        )
+
+    hinweise = []
+    if einvoice.rechnungsnummer != rechnung.rechnungsnummer:
+        hinweise.append(f"Rechnungsnummer laut E-Rechnung {einvoice.rechnungsnummer} (gelesen: {rechnung.rechnungsnummer})")
+    summen = []
+    for steuer in einvoice.steuern:
+        # Only the standard rate maps to one tax on its own; reverse charge or
+        # exemptions need a choice the XML doesn't make.
+        summen.append((steuer.netto, steuer.prozent, None, steuer.kategorie == "S"))
+        if steuer.kategorie != "S":
+            hinweise.append(f"Steuerart {steuer.kategorie or '?'} - Steuer bitte in Odoo prüfen")
+    kontakt = {
+        "email": einvoice.email or agent_kontakt.get("email"),
+        "telefon": einvoice.telefon or agent_kontakt.get("telefon"),
+        "strasse": einvoice.strasse or agent_kontakt.get("strasse"),
+        "plz": einvoice.plz or agent_kontakt.get("plz"),
+        "ort": einvoice.ort or agent_kontakt.get("ort"),
+    }
+    return _Rechnungsdaten(
+        rechnungsnummer=einvoice.rechnungsnummer,
+        rechnungsdatum=einvoice.rechnungsdatum or rechnung.rechnungsdatum,
+        faelligkeitsdatum=einvoice.faelligkeitsdatum or rechnung.faelligkeitsdatum,
+        waehrung=(einvoice.waehrung or rechnung.waehrung).upper(),
+        # Some generators put the address into the name field; the VAT id finds
+        # the supplier anyway, so the agent's reading of the name comes first.
+        lieferant_name=rechnung.lieferant_name or einvoice.lieferant_name,
+        ust_id=einvoice.ust_id or rechnung.ust_id,
+        kontakt=kontakt,
+        iban=einvoice.iban or rechnung.iban,
+        summen=summen or agent_summen,
+        positionen=[
+            {
+                "beschreibung": p.beschreibung[:200],
+                "lieferanten_artikelnummer": p.lieferanten_artikelnummer,
+                "menge": p.menge,
+                "einheit": p.einheit,
+                "einzelpreis": p.einzelpreis,
+            }
+            for p in einvoice.positionen
+        ],
+        quelle=f"e-rechnung ({einvoice.format})",
+        hinweise=hinweise,
+    )
+
+
 @mcp.tool()
 def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
     """Store a supplier invoice in Odoo right away: a DRAFT bill with the file
     attached and one total line per tax rate, never the individual items.
 
-    Finds the supplier itself from lieferant_name / ust_id. Pass the supplier's
-    contact details in kontakt and the IBAN in iban when the invoice or email
-    shows them: missing ones are added to the supplier, differing ones come back
-    as abweichende_kontaktdaten for odoo_lieferant_aktualisieren, and a differing
-    IBAN only raises a warning. Only for known suppliers; status "lieferant_unbekannt" means call odoo_lieferant_anlegen
-    with the supplier details from the invoice, then call this tool again once
-    that is approved. "lieferant_unklar" lists candidates: call again with the
-    right lieferant_id. Repeating it for the same invoice creates nothing twice.
-    After "abgelegt" or "bereits_vorhanden", reply with just the returned meldung.
+    Always pass betraege (net totals per tax rate) - a bill is never stored
+    without its amounts. For an e-invoice (ZUGFeRD / Factur-X / XRechnung) the
+    data in the file wins over what you read, and its items come back in
+    positionen for odoo_preise_pruefen. Pass kategorie (an Odoo product category)
+    when the kind of expense is clear. Pass the supplier's contact details in
+    kontakt and the IBAN in iban when shown: missing ones are added to the
+    supplier, differing ones come back as abweichende_kontaktdaten for
+    odoo_lieferant_aktualisieren, a differing IBAN only raises a warning.
+
+    Checks first whether this invoice number is already in Odoo, for any
+    supplier. Statuses: "abgelegt"; "bereits_vorhanden" / "bereits_abgelegt"
+    (already stored, the meldung says under which supplier - nothing new is
+    created); "nummer_bei_anderem_lieferanten" (ask the user); "lieferant_unbekannt"
+    (call odoo_lieferant_anlegen with lieferant_vorschlag, then this tool again
+    once approved); "lieferant_unklar" (call again with the right lieferant_id).
+    Reply with just the returned meldung.
     """
+    daten = _rechnungsdaten(rechnung)
     client = _odoo()
     try:
+        vorhandene = client.find_bills_by_ref(daten.rechnungsnummer)
         if rechnung.lieferant_id is not None:
             supplier = client.get_supplier(rechnung.lieferant_id)
             if supplier is None:
                 raise OdooError(404, f"partner {rechnung.lieferant_id} is not a supplier")
-            partner_id = rechnung.lieferant_id
+            partner_id, candidates = rechnung.lieferant_id, []
         else:
-            partner_id, candidates = client.match_supplier(rechnung.lieferant_name, rechnung.ust_id)
-            if partner_id is None and candidates:
-                return {
-                    "status": "lieferant_unklar",
-                    "kandidaten": [{"lieferant_id": row["id"], "name": row["name"]} for row in candidates],
-                }
-            if partner_id is None:
-                return {
-                    "status": "lieferant_unbekannt",
-                    "meldung": f"Lieferant {rechnung.lieferant_name or rechnung.ust_id} ist in Odoo noch nicht angelegt.",
-                }
-            supplier = client.get_supplier(partner_id)
-            if supplier is None:
+            partner_id, candidates = client.match_supplier(daten.lieferant_name, daten.ust_id)
+            supplier = client.get_supplier(partner_id) if partner_id is not None else None
+            if partner_id is not None and supplier is None:
                 raise OdooError(409, f"partner {partner_id} matches the invoice but is not marked as a supplier")
 
-        bill_id = client.find_vendor_bill(partner_id, rechnung.rechnungsnummer)
+        same = [bill for bill in vorhandene if partner_id is not None and bill["partner_id"] == partner_id]
+        if vorhandene and not same:
+            names = ", ".join(sorted({bill["partner_name"] for bill in vorhandene}))
+            if partner_id is not None:
+                return {
+                    "status": "nummer_bei_anderem_lieferanten",
+                    "meldung": (
+                        f"Rechnungsnummer {daten.rechnungsnummer} gibt es in Odoo schon bei {names}, "
+                        f"die Rechnung kommt aber von {supplier['name']}. Bitte prüfen."
+                    ),
+                    "vorhandene_rechnungen": vorhandene,
+                }
+            return {
+                "status": "bereits_abgelegt",
+                "meldung": f"Rechnung {daten.rechnungsnummer} ist schon in Odoo abgelegt, beim Lieferanten {names}.",
+                "vorhandene_rechnungen": vorhandene,
+            }
+        if partner_id is None and candidates:
+            return {
+                "status": "lieferant_unklar",
+                "kandidaten": [{"lieferant_id": row["id"], "name": row["name"]} for row in candidates],
+            }
+        if partner_id is None:
+            vorschlag = {
+                "name": daten.lieferant_name,
+                "ust_id": daten.ust_id,
+                **{key: value for key, value in daten.kontakt.items() if value},
+            }
+            return {
+                "status": "lieferant_unbekannt",
+                "meldung": f"Lieferant {daten.lieferant_name or daten.ust_id} ist in Odoo noch nicht angelegt.",
+                "lieferant_vorschlag": {key: value for key, value in vorschlag.items() if value},
+            }
+
+        bill_id = same[0]["id"] if same else None
         created = bill_id is None
+        kategorie_hinweis = None
         if created:
-            lines = []
-            for betrag in rechnung.betraege:
-                tax = client.resolve_purchase_tax(betrag.steuer_prozent, betrag.steuer_name)
-                lines.append(
-                    {
-                        "name": f"Rechnung {rechnung.rechnungsnummer} – Gesamtbetrag {tax['name']}",
-                        "quantity": 1,
-                        "price_unit": betrag.netto,
-                        "tax_ids": [[6, 0, [tax["id"]]]],
-                    }
+            if not daten.summen:
+                return {
+                    "error": "betraege missing: read the net totals per tax rate from the invoice and call again",
+                    "status_code": 422,
+                }
+            category = client.find_category(rechnung.kategorie) if rechnung.kategorie else None
+            if rechnung.kategorie and category is None:
+                kategorie_hinweis = (
+                    f"Kategorie {rechnung.kategorie!r} gibt es nicht; vorhanden: {', '.join(client.category_names())}"
                 )
+            lines = []
+            for netto, prozent, steuer_name, waehlbar in daten.summen:
+                tax = client.resolve_purchase_tax(prozent, steuer_name) if waehlbar else None
+                label = f"Rechnung {daten.rechnungsnummer} – Gesamtbetrag {tax['name'] if tax else f'{prozent:g} %'}"
+                line = {"name": label + (f" – {category['name']}" if category else ""), "quantity": 1, "price_unit": netto}
+                if tax:
+                    line["tax_ids"] = [[6, 0, [tax["id"]]]]
+                if category and category.get("account_id"):
+                    line["account_id"] = category["account_id"]
+                lines.append(line)
             bill_id = client.create_draft_vendor_bill(
                 partner_id=partner_id,
-                rechnungsnummer=rechnung.rechnungsnummer,
-                rechnungsdatum=rechnung.rechnungsdatum.isoformat(),
-                faelligkeitsdatum=rechnung.faelligkeitsdatum.isoformat() if rechnung.faelligkeitsdatum else None,
-                waehrung=rechnung.waehrung,
+                rechnungsnummer=daten.rechnungsnummer,
+                rechnungsdatum=daten.rechnungsdatum.isoformat(),
+                faelligkeitsdatum=daten.faelligkeitsdatum.isoformat() if daten.faelligkeitsdatum else None,
+                waehrung=daten.waehrung,
                 lines=lines,
             )
 
         stored = [_attach_one(client, anhang, bill_id) for anhang in rechnung.anhaenge]
         new_attachments = [item["attachment_id"] for item in stored if item["added"]]
-        hinweis = None
+        hinweise = list(daten.hinweise) + ([kategorie_hinweis] if kategorie_hinweis else [])
         if created and new_attachments:
             # Shows the PDF next to the bill form. Never worth failing the store for.
             try:
                 client.set_main_attachment(bill_id, new_attachments[0])
             except OdooError as exc:
-                hinweis = f"Hauptanhang nicht gesetzt: {exc}"
+                hinweise.append(f"Hauptanhang nicht gesetzt: {exc}")
         total = client.bill_total(bill_id)
     except OdooError as exc:
         return _error(exc)
 
     # Only after the bill is safe: a problem with the supplier's details must
     # never cost the invoice.
-    printed = {**(rechnung.kontakt.model_dump() if rechnung.kontakt else {}), "ust_id": rechnung.ust_id}
+    printed = {**daten.kontakt, "ust_id": daten.ust_id}
     filled: dict[str, str] = {}
     differ: dict[str, dict] = {}
     iban_warning = False
@@ -425,18 +556,18 @@ def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
         filled, differ = _contact_changes(client.supplier_contact(partner_id), printed)
         if filled:
             client.update_supplier_contact(partner_id, filled)
-        if rechnung.iban:
+        if daten.iban:
             known = client.supplier_ibans(partner_id)
-            iban_warning = bool(known) and _normalized_iban(rechnung.iban) not in known
+            iban_warning = bool(known) and _normalized_iban(daten.iban) not in known
     except OdooError as exc:
         filled = {}
-        hinweis = f"Kontaktdaten nicht ergänzt: {exc}"
+        hinweise.append(f"Kontaktdaten nicht ergänzt: {exc}")
 
     amount = f" ({_euro(total)})" if total else ""
     if created:
-        meldung = f"Rechnung {rechnung.rechnungsnummer} von {supplier['name']}{amount} als Entwurf in Odoo abgelegt."
+        meldung = f"Rechnung {daten.rechnungsnummer} von {supplier['name']}{amount} als Entwurf in Odoo abgelegt."
     else:
-        meldung = f"Rechnung {rechnung.rechnungsnummer} von {supplier['name']} war schon in Odoo."
+        meldung = f"Rechnung {daten.rechnungsnummer} von {supplier['name']} war schon in Odoo."
     if filled:
         meldung += f" Beim Lieferanten ergänzt: {_labels(filled)}."
     if iban_warning:
@@ -449,16 +580,19 @@ def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
         "meldung": meldung,
         "rechnung_id": bill_id,
         "lieferant_id": partner_id,
+        "quelle": daten.quelle,
         "anhaenge": stored,
     }
+    if daten.positionen:
+        result["positionen"] = daten.positionen
     if differ:
         result["abweichende_kontaktdaten"] = differ
         result["naechster_schritt"] = (
             "call odoo_lieferant_aktualisieren with this lieferant_id and the new values, "
             "so a human can approve the change"
         )
-    if hinweis:
-        result["hinweis"] = hinweis
+    if hinweise:
+        result["hinweis"] = "; ".join(hinweise)
     return result
 
 
@@ -832,3 +966,80 @@ def odoo_lieferant_aktualisieren_execute(ctx: Context, approval_id: str) -> dict
     except OdooError as exc:
         return _error(exc)
     return {"lieferant_id": partner_id, "geaendert": sorted(values)}
+
+
+@mcp.tool()
+def odoo_einkaufspreise_aendern(ctx: Context, aenderungen: list[EinkaufspreisRequest]) -> PendingApprovalDTO:
+    """Request ONE human approval for several supplier price changes at once,
+    e.g. all prices odoo_preise_pruefen found different or missing on one
+    invoice. Writes nothing yet. Once approved, call
+    odoo_einkaufspreise_aendern_execute."""
+    if not 1 <= len(aenderungen) <= 30:
+        raise OdooError(400, "give between 1 and 30 price changes")
+    client = _odoo()
+    preise = []
+    for aenderung in aenderungen:
+        row = client.get_one(
+            "product.supplierinfo", aenderung.lieferantenpreis_id, ["partner_id", "product_tmpl_id", "price"]
+        )
+        if row is None:
+            raise OdooError(404, f"supplier price {aenderung.lieferantenpreis_id} not found")
+        preise.append(
+            {
+                "lieferantenpreis_id": aenderung.lieferantenpreis_id,
+                "artikel": _m2o_name(row.get("product_tmpl_id")),
+                "lieferant": _m2o_name(row.get("partner_id")),
+                "alter_preis": float(row.get("price") or 0.0),
+                "neuer_preis": aenderung.neuer_preis,
+            }
+        )
+    suppliers = sorted({p["lieferant"] or "?" for p in preise})
+    request = approvals.create(
+        _resolve_tenant_id(ctx),
+        action="odoo_einkaufspreise_aendern",
+        resource_id=", ".join(suppliers),
+        data={"preise": preise},
+        ttl=ODOO_APPROVAL_TTL,
+    )
+    return _pending_response(
+        request, f"Einkaufspreise von {len(preise)} Artikel(n) bei {', '.join(suppliers)} anpassen?"
+    )
+
+
+@mcp.tool()
+def odoo_einkaufspreise_aendern_execute(ctx: Context, approval_id: str) -> dict:
+    """Apply an approved odoo_einkaufspreise_aendern request. Fails unless a
+    human has approved it; each approval works once. A price that changed in
+    Odoo since the request, or whose new value was cleared on the card, is
+    skipped and reported; the others are applied."""
+    try:
+        approval = approvals.consume_approved(approval_id, _resolve_tenant_id(ctx), "odoo_einkaufspreise_aendern")
+    except (approvals.ApprovalNotFoundError, approvals.ApprovalStateError) as exc:
+        return _approval_error(exc, approval_id)
+    client = _odoo()
+    geaendert, uebersprungen = [], []
+    try:
+        for preis in approval.data["preise"]:
+            artikel = preis.get("artikel") or str(preis["lieferantenpreis_id"])
+            try:
+                neu = float(preis["neuer_preis"])
+            except (TypeError, ValueError):
+                uebersprungen.append({"artikel": artikel, "grund": "kein neuer Preis"})
+                continue
+            if neu < 0:
+                uebersprungen.append({"artikel": artikel, "grund": "negativer Preis"})
+                continue
+            row = client.get_one("product.supplierinfo", int(preis["lieferantenpreis_id"]), ["price"])
+            if row is None:
+                uebersprungen.append({"artikel": artikel, "grund": "Lieferantenpreis nicht mehr vorhanden"})
+                continue
+            if abs((row.get("price") or 0.0) - float(preis["alter_preis"])) > 1e-6:
+                uebersprungen.append({"artikel": artikel, "grund": f"Preis inzwischen {row.get('price')}"})
+                continue
+            client.set_supplier_price(int(preis["lieferantenpreis_id"]), neu)
+            geaendert.append({"artikel": artikel, "alter_preis": float(preis["alter_preis"]), "neuer_preis": neu})
+    except OdooError as exc:
+        error = _error(exc)
+        error["bereits_geaendert"] = geaendert
+        return error
+    return {"geaendert": geaendert, "uebersprungen": uebersprungen}

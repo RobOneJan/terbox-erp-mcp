@@ -373,6 +373,47 @@ class OdooClient:
         vals = {SUPPLIER_CONTACT_FIELDS[name]: value for name, value in values.items()}
         self._call("res.partner", "write", ids=[partner_id], vals=vals)
 
+    def find_bills_by_ref(self, rechnungsnummer: str) -> list[dict]:
+        """Vendor bills with this supplier invoice number, for any supplier,
+        leaving out cancelled ones."""
+        rows = self.search_read(
+            "account.move",
+            [["move_type", "=", "in_invoice"], ["ref", "=", rechnungsnummer], ["state", "!=", "cancel"]],
+            ["partner_id", "state", "amount_total"],
+            limit=10,
+        )
+        return [
+            {
+                "id": row["id"],
+                "partner_id": row["partner_id"][0] if row.get("partner_id") else None,
+                "partner_name": row["partner_id"][1] if row.get("partner_id") else "?",
+                "status": row.get("state"),
+                "betrag": row.get("amount_total"),
+            }
+            for row in rows
+        ]
+
+    def find_category(self, name: str) -> dict | None:
+        rows = self.search_read(
+            "product.category",
+            [["complete_name", "=ilike", name.strip()]],
+            ["complete_name", "property_account_expense_categ_id"],
+            limit=1,
+        ) or self.search_read(
+            "product.category", [["name", "=ilike", name.strip()]], ["complete_name", "property_account_expense_categ_id"], limit=1
+        )
+        if not rows:
+            return None
+        account = rows[0].get("property_account_expense_categ_id")
+        return {
+            "id": rows[0]["id"],
+            "name": rows[0]["complete_name"],
+            "account_id": account[0] if isinstance(account, list) else None,
+        }
+
+    def category_names(self) -> list[str]:
+        return [row["complete_name"] for row in self.search_read("product.category", [], ["complete_name"], limit=MAX_LIMIT)]
+
     def bill_total(self, bill_id: int) -> float | None:
         rows = self.read("account.move", [bill_id], ["amount_total"])
         return rows[0].get("amount_total") if rows else None
