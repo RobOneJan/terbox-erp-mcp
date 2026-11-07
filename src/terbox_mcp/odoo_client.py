@@ -82,6 +82,9 @@ SUPPLIER_CONTACT_FIELDS = {
     "ort": "city",
 }
 
+# Analytic plan whose accounts are the cost types an invoice can be filed under.
+COST_TYPE_PLAN = "Kostenarten"
+
 MAX_LIMIT = 200
 DEFAULT_LIMIT = 50
 # Binary fields (images, reports) come back as huge base64 strings. Nothing an
@@ -393,26 +396,25 @@ class OdooClient:
             for row in rows
         ]
 
-    def find_category(self, name: str) -> dict | None:
+    def find_cost_type(self, name: str) -> dict | None:
+        """An analytic account of the COST_TYPE_PLAN plan (Einzelkosten /
+        Gemeinkosten below it), for internal reporting of what money went on."""
         rows = self.search_read(
-            "product.category",
-            [["complete_name", "=ilike", name.strip()]],
-            ["complete_name", "property_account_expense_categ_id"],
+            "account.analytic.account",
+            [["root_plan_id.name", "=", COST_TYPE_PLAN], ["name", "=ilike", name.strip()]],
+            ["name", "plan_id"],
             limit=1,
-        ) or self.search_read(
-            "product.category", [["name", "=ilike", name.strip()]], ["complete_name", "property_account_expense_categ_id"], limit=1
         )
         if not rows:
             return None
-        account = rows[0].get("property_account_expense_categ_id")
-        return {
-            "id": rows[0]["id"],
-            "name": rows[0]["complete_name"],
-            "account_id": account[0] if isinstance(account, list) else None,
-        }
+        plan = rows[0].get("plan_id")
+        return {"id": rows[0]["id"], "name": rows[0]["name"], "plan": plan[1] if isinstance(plan, list) else None}
 
-    def category_names(self) -> list[str]:
-        return [row["complete_name"] for row in self.search_read("product.category", [], ["complete_name"], limit=MAX_LIMIT)]
+    def cost_type_names(self) -> list[str]:
+        rows = self.search_read(
+            "account.analytic.account", [["root_plan_id.name", "=", COST_TYPE_PLAN]], ["name"], limit=MAX_LIMIT
+        )
+        return sorted(row["name"] for row in rows)
 
     def bill_total(self, bill_id: int) -> float | None:
         rows = self.read("account.move", [bill_id], ["amount_total"])

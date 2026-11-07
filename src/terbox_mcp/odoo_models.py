@@ -155,7 +155,12 @@ class RechnungAblageRequest(BaseModel):
     )
     kategorie: Optional[str] = Field(
         default=None,
-        description="Odoo product category for the kind of expense, e.g. 'Werkzeuge' or 'Marketing'.",
+        description=(
+            "Cost type for internal reporting (analytic account of the plan 'Kostenarten'). "
+            "Einzelkosten: Material, Fremdleistung. Gemeinkosten: Werkzeuge & Betriebsmittel, "
+            "Fahrzeuge & Kraftstoff, Transport & Versand, Marketing, IT & Software, Büro & Verwaltung, "
+            "Gebäude & Miete, Beratung & Dienstleistungen, Sonstiges."
+        ),
     )
 
     @field_validator("waehrung")

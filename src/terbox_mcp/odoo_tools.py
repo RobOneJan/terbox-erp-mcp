@@ -437,8 +437,9 @@ def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
     Always pass betraege (net totals per tax rate) - a bill is never stored
     without its amounts. For an e-invoice (ZUGFeRD / Factur-X / XRechnung) the
     data in the file wins over what you read, and its items come back in
-    positionen for odoo_preise_pruefen. Pass kategorie (an Odoo product category)
-    when the kind of expense is clear. Pass the supplier's contact details in
+    positionen for odoo_preise_pruefen. Pass kategorie (a cost type for internal
+    reporting) when the kind of expense is clear; pick the predominant one for a
+    mixed invoice, leave it out when unsure. Pass the supplier's contact details in
     kontakt and the IBAN in iban when shown: missing ones are added to the
     supplier, differing ones come back as abweichende_kontaktdaten for
     odoo_lieferant_aktualisieren, a differing IBAN only raises a warning.
@@ -509,20 +510,20 @@ def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
                     "error": "betraege missing: read the net totals per tax rate from the invoice and call again",
                     "status_code": 422,
                 }
-            category = client.find_category(rechnung.kategorie) if rechnung.kategorie else None
-            if rechnung.kategorie and category is None:
+            cost_type = client.find_cost_type(rechnung.kategorie) if rechnung.kategorie else None
+            if rechnung.kategorie and cost_type is None:
                 kategorie_hinweis = (
-                    f"Kategorie {rechnung.kategorie!r} gibt es nicht; vorhanden: {', '.join(client.category_names())}"
+                    f"Kostenart {rechnung.kategorie!r} gibt es nicht; vorhanden: {', '.join(client.cost_type_names())}"
                 )
             lines = []
             for netto, prozent, steuer_name, waehlbar in daten.summen:
                 tax = client.resolve_purchase_tax(prozent, steuer_name) if waehlbar else None
                 label = f"Rechnung {daten.rechnungsnummer} – Gesamtbetrag {tax['name'] if tax else f'{prozent:g} %'}"
-                line = {"name": label + (f" – {category['name']}" if category else ""), "quantity": 1, "price_unit": netto}
+                line = {"name": label + (f" – {cost_type['name']}" if cost_type else ""), "quantity": 1, "price_unit": netto}
                 if tax:
                     line["tax_ids"] = [[6, 0, [tax["id"]]]]
-                if category and category.get("account_id"):
-                    line["account_id"] = category["account_id"]
+                if cost_type:
+                    line["analytic_distribution"] = {str(cost_type["id"]): 100}
                 lines.append(line)
             bill_id = client.create_draft_vendor_bill(
                 partner_id=partner_id,

@@ -28,8 +28,10 @@ on individual models are not exposed, only the generic ones (`READ_METHODS`).
 the supplier from name or VAT id and stores a draft bill with the PDF and one
 total line per tax rate, never the individual items, and never posts it. It is
 never stored without amounts. It first checks whether the invoice number is
-already in Odoo for any supplier. An optional product category sets the line's
-expense account from that category. Only known suppliers qualify.
+already in Odoo for any supplier. An optional cost type (`kategorie`, an analytic
+account of the plan "Kostenarten", split into Einzelkosten and Gemeinkosten)
+goes on the line for internal overhead reporting; the financial account stays
+Odoo's own choice. Only known suppliers qualify.
 
 For e-invoices (ZUGFeRD / Factur-X / XRechnung, embedded in the PDF or as an XML
 file; see `einvoice.py`) the data in the file wins over what the agent read:

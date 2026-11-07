@@ -229,21 +229,26 @@ def test_same_number_at_a_different_known_supplier_is_flagged_not_stored(odoo: F
     assert odoo.writes() == []
 
 
-def test_category_sets_its_expense_account_and_label(odoo: FakeOdoo) -> None:  # noqa: F811
+def test_cost_type_goes_on_the_line_as_analytic_distribution(odoo: FakeOdoo) -> None:  # noqa: F811
     _odoo_for_bills(odoo)
-    odoo.responses[("product.category", "search_read")] = [
-        {"id": 10, "complete_name": "Werkzeuge", "property_account_expense_categ_id": [950, "4985 Werkzeuge"]}
+    odoo.responses[("account.analytic.account", "search_read")] = [
+        {"id": 3, "name": "Werkzeuge & Betriebsmittel", "plan_id": [4, "Kostenarten / Gemeinkosten"]}
     ]
 
-    odoo_tools.odoo_rechnung_ablegen(_request(_pdf_with(_cii()), kategorie="werkzeuge"))
+    odoo_tools.odoo_rechnung_ablegen(_request(_pdf_with(_cii()), kategorie="werkzeuge & betriebsmittel"))
 
     [line] = odoo.body_of("account.move", "create")["vals_list"][0]["invoice_line_ids"]
-    assert line[2]["account_id"] == 950
-    assert line[2]["name"].endswith("– Werkzeuge")
+    assert line[2]["analytic_distribution"] == {"3": 100}
+    assert "account_id" not in line[2]  # the financial account stays Odoo's choice
+    assert line[2]["name"].endswith("– Werkzeuge & Betriebsmittel")
+    search = odoo.body_of("account.analytic.account", "search_read")
+    assert ["root_plan_id.name", "=", "Kostenarten"] in search["domain"]
 
 
-def test_unknown_category_still_stores_the_invoice(odoo: FakeOdoo) -> None:  # noqa: F811
+def test_unknown_cost_type_still_stores_the_invoice(odoo: FakeOdoo) -> None:  # noqa: F811
     _odoo_for_bills(odoo)
     result = odoo_tools.odoo_rechnung_ablegen(_request(_pdf_with(_cii()), kategorie="Gibtsnicht"))
     assert result["status"] == "abgelegt"
-    assert "Kategorie 'Gibtsnicht' gibt es nicht" in result["hinweis"]
+    assert "Kostenart 'Gibtsnicht' gibt es nicht" in result["hinweis"]
+    [line] = odoo.body_of("account.move", "create")["vals_list"][0]["invoice_line_ids"]
+    assert "analytic_distribution" not in line[2]
