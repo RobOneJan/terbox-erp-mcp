@@ -15,6 +15,13 @@ from terbox_mcp.einvoice import read_einvoice
 from terbox_mcp.odoo_models import RechnungAblageRequest
 from tests.test_odoo_tools import FakeOdoo, _odoo_for_bills, odoo  # noqa: F401 - fixture
 
+
+def _ablegen(rechnung, ctx=None) -> dict:
+    """odoo_rechnung_ablegen as a plain dict of the fields it set."""
+    from types import SimpleNamespace as _NS
+
+    return odoo_tools.odoo_rechnung_ablegen(ctx or _NS(headers=None), rechnung).model_dump(exclude_defaults=True)
+
 CII = """<?xml version="1.0" encoding="UTF-8"?>
 <rsm:CrossIndustryInvoice xmlns:rsm="urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100"
   xmlns:ram="urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100"
@@ -158,7 +165,7 @@ def _request(content: bytes, **overrides) -> RechnungAblageRequest:
 def test_einvoice_data_wins_over_what_the_agent_read(odoo: FakeOdoo) -> None:  # noqa: F811
     _odoo_for_bills(odoo)
 
-    result = odoo_tools.odoo_rechnung_ablegen(
+    result = _ablegen(
         _request(_pdf_with(_cii()), rechnungsnummer="ER-l", rechnungsdatum="2026-11-07")
     )
 
@@ -175,7 +182,7 @@ def test_einvoice_data_wins_over_what_the_agent_read(odoo: FakeOdoo) -> None:  #
 
 def test_supplier_is_found_by_the_einvoice_vat_id_despite_a_garbled_name(odoo: FakeOdoo) -> None:  # noqa: F811
     _odoo_for_bills(odoo)
-    result = odoo_tools.odoo_rechnung_ablegen(
+    result = _ablegen(
         # What the agent reads off such a document, too: no usable name, no VAT id.
         _request(_pdf_with(_cii(name="Hohe Giethorst 60 46397 Bocholt")), lieferant_name="Hohe Giethorst 60")
     )
@@ -184,7 +191,7 @@ def test_supplier_is_found_by_the_einvoice_vat_id_despite_a_garbled_name(odoo: F
 
 def test_non_standard_tax_is_stored_with_its_amount_but_no_guessed_tax(odoo: FakeOdoo) -> None:  # noqa: F811
     _odoo_for_bills(odoo)
-    result = odoo_tools.odoo_rechnung_ablegen(_request(_pdf_with(_cii(steuerart="AE"))))
+    result = _ablegen(_request(_pdf_with(_cii(steuerart="AE"))))
     [line] = odoo.body_of("account.move", "create")["vals_list"][0]["invoice_line_ids"]
     assert line[2]["price_unit"] == 100.0
     assert "tax_ids" not in line[2]
@@ -197,11 +204,12 @@ def test_unknown_supplier_gets_a_proposal_from_the_einvoice(odoo: FakeOdoo, monk
     monkeypatch.setattr(sys.modules["tests.test_odoo_tools"], "SUPPLIERS", [])
     _odoo_for_bills(odoo)
 
-    result = odoo_tools.odoo_rechnung_ablegen(_request(_pdf_with(_cii()), lieferant_name="Zaunbau Neu GmbH"))
+    result = _ablegen(_request(_pdf_with(_cii()), lieferant_name="Zaunbau Neu GmbH"))
 
-    assert result["status"] == "lieferant_unbekannt"
-    assert result["lieferant_vorschlag"]["ust_id"] == "DE123456789"
-    assert result["lieferant_vorschlag"]["email"] == "rechnung@zaunbau.de"
+    assert result["ergebnis"] == "neuer_lieferant"
+    assert result["payload"]["lieferant.ust_id"] == "DE123456789"
+    assert result["payload"]["lieferant.email"] == "rechnung@zaunbau.de"
+    assert result["payload"]["rechnungsnummer"] == "ER-1"
     assert odoo.writes() == []
 
 
@@ -212,7 +220,7 @@ def test_invoice_already_stored_under_another_supplier_is_not_stored_again(odoo:
     _odoo_for_bills(odoo)
     odoo.responses[("account.move", "search_read")] = [{"id": 5, "partner_id": [30, "Reiswich GmbH"], "state": "draft"}]
 
-    result = odoo_tools.odoo_rechnung_ablegen(_request(_pdf_with(_cii()), lieferant_name="Haus & Dach"))
+    result = _ablegen(_request(_pdf_with(_cii()), lieferant_name="Haus & Dach"))
 
     assert result["status"] == "bereits_abgelegt"
     assert "Reiswich GmbH" in result["meldung"]
@@ -223,7 +231,7 @@ def test_same_number_at_a_different_known_supplier_is_flagged_not_stored(odoo: F
     _odoo_for_bills(odoo)
     odoo.responses[("account.move", "search_read")] = [{"id": 5, "partner_id": [30, "Reiswich GmbH"], "state": "draft"}]
 
-    result = odoo_tools.odoo_rechnung_ablegen(_request(_pdf_with(_cii())))
+    result = _ablegen(_request(_pdf_with(_cii())))
 
     assert result["status"] == "nummer_bei_anderem_lieferanten"
     assert odoo.writes() == []
@@ -235,7 +243,7 @@ def test_cost_type_goes_on_the_line_as_analytic_distribution(odoo: FakeOdoo) -> 
         {"id": 3, "name": "Werkzeuge & Betriebsmittel", "plan_id": [4, "Kostenarten / Gemeinkosten"]}
     ]
 
-    odoo_tools.odoo_rechnung_ablegen(_request(_pdf_with(_cii()), kategorie="werkzeuge & betriebsmittel"))
+    _ablegen(_request(_pdf_with(_cii()), kategorie="werkzeuge & betriebsmittel"))
 
     [line] = odoo.body_of("account.move", "create")["vals_list"][0]["invoice_line_ids"]
     assert line[2]["analytic_distribution"] == {"3": 100}
@@ -247,8 +255,8 @@ def test_cost_type_goes_on_the_line_as_analytic_distribution(odoo: FakeOdoo) -> 
 
 def test_unknown_cost_type_still_stores_the_invoice(odoo: FakeOdoo) -> None:  # noqa: F811
     _odoo_for_bills(odoo)
-    result = odoo_tools.odoo_rechnung_ablegen(_request(_pdf_with(_cii()), kategorie="Gibtsnicht"))
-    assert result["status"] == "abgelegt"
+    result = _ablegen(_request(_pdf_with(_cii()), kategorie="Gibtsnicht"))
+    assert result["ergebnis"] == "abgelegt"
     assert "Kostenart 'Gibtsnicht' gibt es nicht" in result["hinweis"]
     [line] = odoo.body_of("account.move", "create")["vals_list"][0]["invoice_line_ids"]
     assert "analytic_distribution" not in line[2]

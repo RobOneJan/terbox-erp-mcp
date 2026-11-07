@@ -19,7 +19,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from mcp.server.mcpserver import Context
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from terbox_mcp import approvals
 from terbox_mcp.einvoice import read_einvoice
@@ -429,10 +429,107 @@ def _rechnungsdaten(rechnung: RechnungAblageRequest) -> _Rechnungsdaten:
     )
 
 
+class RechnungAblageDTO(BaseModel):
+    """Result of odoo_rechnung_ablegen. One model for every outcome, because a
+    Union return nests structured_content under "result" and agent-hub would no
+    longer see a pending approval. When a card is waiting, id / status="pending"
+    / message / payload are what agent-hub's _looks_like_pending_approval reads;
+    `ergebnis` always says what actually happened."""
+
+    status: str
+    ergebnis: str
+    meldung: str | None = None
+    id: str | None = None
+    message: str | None = None
+    payload: dict[str, str] = Field(default_factory=dict)
+    rechnung_id: int | None = None
+    lieferant_id: int | None = None
+    quelle: str | None = None
+    anhaenge: list[dict] = Field(default_factory=list)
+    positionen: list[dict] = Field(default_factory=list)
+    abweichende_kontaktdaten: dict = Field(default_factory=dict)
+    kandidaten: list[dict] = Field(default_factory=list)
+    vorhandene_rechnungen: list[dict] = Field(default_factory=list)
+    naechster_schritt: str | None = None
+    hinweis: str | None = None
+    error: str | None = None
+    status_code: int | None = None
+
+
+def _done(ergebnis: str, **fields) -> RechnungAblageDTO:
+    return RechnungAblageDTO(status=ergebnis, ergebnis=ergebnis, **fields)
+
+
+def _failed(exc: OdooError) -> RechnungAblageDTO:
+    return RechnungAblageDTO(status="error", ergebnis="error", error=str(exc), status_code=exc.status_code)
+
+
+def _bill_lines(client: OdooClient, rechnungsnummer: str, betraege: list[dict], cost_type: dict | None) -> list[dict]:
+    """One total line per tax rate. `betraege`: {"netto", "steuer"} where steuer
+    is an exact Odoo purchase tax name, or "" for none (a tax the XML doesn't
+    settle on its own, left for the human to choose)."""
+    lines = []
+    for betrag in betraege:
+        tax = client.resolve_purchase_tax_by_name(betrag["steuer"]) if betrag.get("steuer") else None
+        label = f"Rechnung {rechnungsnummer} – Gesamtbetrag {tax['name'] if tax else 'ohne Steuer'}"
+        line = {"name": label + (f" – {cost_type['name']}" if cost_type else ""), "quantity": 1, "price_unit": float(betrag["netto"])}
+        if tax:
+            line["tax_ids"] = [[6, 0, [tax["id"]]]]
+        if cost_type:
+            line["analytic_distribution"] = {str(cost_type["id"]): 100}
+        lines.append(line)
+    return lines
+
+
+def _betraege(client: OdooClient, daten: _Rechnungsdaten) -> list[dict]:
+    """The totals with their tax resolved to a name now, so the card shows the
+    concrete tax and a human can correct it there."""
+    betraege = []
+    for netto, prozent, steuer_name, waehlbar in daten.summen:
+        steuer = client.resolve_purchase_tax(prozent, steuer_name)["name"] if waehlbar else ""
+        betraege.append({"netto": netto, "steuer": steuer})
+    return betraege
+
+
+def _store_bill(
+    client: OdooClient,
+    *,
+    partner_id: int,
+    rechnungsnummer: str,
+    rechnungsdatum: str,
+    faelligkeitsdatum: str | None,
+    waehrung: str,
+    betraege: list[dict],
+    cost_type: dict | None,
+    files: list[tuple[str, bytes]],
+) -> tuple[int, list[dict], list[str]]:
+    bill_id = client.create_draft_vendor_bill(
+        partner_id=partner_id,
+        rechnungsnummer=rechnungsnummer,
+        rechnungsdatum=rechnungsdatum,
+        faelligkeitsdatum=faelligkeitsdatum,
+        waehrung=waehrung,
+        lines=_bill_lines(client, rechnungsnummer, betraege, cost_type),
+    )
+    stored, hinweise = [], []
+    for filename, blob in files:
+        content_type = sniff_content_type(blob) or "application/octet-stream"
+        stored.append({"dateiname": filename, **client.attach("account.move", bill_id, filename, blob, content_type)})
+    new_attachments = [item["attachment_id"] for item in stored if item["added"]]
+    if new_attachments:
+        # Shows the PDF next to the bill form. Never worth failing the store for.
+        try:
+            client.set_main_attachment(bill_id, new_attachments[0])
+        except OdooError as exc:
+            hinweise.append(f"Hauptanhang nicht gesetzt: {exc}")
+    return bill_id, stored, hinweise
+
+
 @mcp.tool()
-def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
-    """Store a supplier invoice in Odoo right away: a DRAFT bill with the file
-    attached and one total line per tax rate, never the individual items.
+def odoo_rechnung_ablegen(ctx: Context, rechnung: RechnungAblageRequest) -> RechnungAblageDTO:
+    """Store a supplier invoice in Odoo as a DRAFT bill with its file and one
+    total line per tax rate (never the individual items), and ask a human with
+    ONE approval card to book it.
 
     Always pass betraege (net totals per tax rate) - a bill is never stored
     without its amounts. For an e-invoice (ZUGFeRD / Factur-X / XRechnung) the
@@ -445,15 +542,18 @@ def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
     odoo_lieferant_aktualisieren, a differing IBAN only raises a warning.
 
     Checks first whether this invoice number is already in Odoo, for any
-    supplier. Statuses: "abgelegt"; "bereits_vorhanden" / "bereits_abgelegt"
-    (already stored, the meldung says under which supplier - nothing new is
-    created); "nummer_bei_anderem_lieferanten" (ask the user); "lieferant_unbekannt"
-    (call odoo_lieferant_anlegen with lieferant_vorschlag, then this tool again
-    once approved); "lieferant_unklar" (call again with the right lieferant_id).
+    supplier. ergebnis: "abgelegt" (draft stored, card asks to book it -
+    approving calls odoo_rechnung_buchen_execute); "neuer_lieferant" (supplier
+    not in Odoo: nothing stored yet, ONE card asks to create the supplier and
+    book the invoice - approving calls odoo_rechnung_mit_lieferant_buchen_execute);
+    "bereits_vorhanden" / "bereits_abgelegt" (already in Odoo, the meldung says
+    under which supplier); "nummer_bei_anderem_lieferanten" (ask the user);
+    "lieferant_unklar" (call again with the right lieferant_id from kandidaten).
     Reply with just the returned meldung.
     """
     daten = _rechnungsdaten(rechnung)
     client = _odoo()
+    tenant_id = _resolve_tenant_id(ctx)
     try:
         vorhandene = client.find_bills_by_ref(daten.rechnungsnummer)
         if rechnung.lieferant_id is not None:
@@ -471,104 +571,110 @@ def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
         if vorhandene and not same:
             names = ", ".join(sorted({bill["partner_name"] for bill in vorhandene}))
             if partner_id is not None:
-                return {
-                    "status": "nummer_bei_anderem_lieferanten",
-                    "meldung": (
+                return _done(
+                    "nummer_bei_anderem_lieferanten",
+                    meldung=(
                         f"Rechnungsnummer {daten.rechnungsnummer} gibt es in Odoo schon bei {names}, "
                         f"die Rechnung kommt aber von {supplier['name']}. Bitte prüfen."
                     ),
-                    "vorhandene_rechnungen": vorhandene,
-                }
-            return {
-                "status": "bereits_abgelegt",
-                "meldung": f"Rechnung {daten.rechnungsnummer} ist schon in Odoo abgelegt, beim Lieferanten {names}.",
-                "vorhandene_rechnungen": vorhandene,
-            }
+                    vorhandene_rechnungen=vorhandene,
+                )
+            return _done(
+                "bereits_abgelegt",
+                meldung=f"Rechnung {daten.rechnungsnummer} ist schon in Odoo abgelegt, beim Lieferanten {names}.",
+                vorhandene_rechnungen=vorhandene,
+            )
         if partner_id is None and candidates:
-            return {
-                "status": "lieferant_unklar",
-                "kandidaten": [{"lieferant_id": row["id"], "name": row["name"]} for row in candidates],
-            }
+            return _done(
+                "lieferant_unklar", kandidaten=[{"lieferant_id": row["id"], "name": row["name"]} for row in candidates]
+            )
+        if same:
+            bill_id = same[0]["id"]
+            for anhang in rechnung.anhaenge:
+                _attach_one(client, anhang, bill_id)
+            return _done(
+                "bereits_vorhanden",
+                meldung=f"Rechnung {daten.rechnungsnummer} von {supplier['name']} war schon in Odoo.",
+                rechnung_id=bill_id,
+                lieferant_id=partner_id,
+            )
+        if not daten.summen:
+            return RechnungAblageDTO(
+                status="error",
+                ergebnis="error",
+                error="betraege missing: read the net totals per tax rate from the invoice and call again",
+                status_code=422,
+            )
+
+        cost_type = client.find_cost_type(rechnung.kategorie) if rechnung.kategorie else None
+        hinweise = list(daten.hinweise)
+        if rechnung.kategorie and cost_type is None:
+            hinweise.append(f"Kostenart {rechnung.kategorie!r} gibt es nicht; vorhanden: {', '.join(client.cost_type_names())}")
+        betraege = _betraege(client, daten)
+        files = [(anhang.dateiname, anhang.raw()) for anhang in rechnung.anhaenge]
+        gesamt = _euro(sum(b["netto"] for b in betraege))
+
         if partner_id is None:
-            vorschlag = {
-                "name": daten.lieferant_name,
+            # Nothing is stored before the human approves: without a supplier
+            # there is nothing to file the bill under.
+            lieferant = {
+                "name": daten.lieferant_name or daten.ust_id,
                 "ust_id": daten.ust_id,
                 **{key: value for key, value in daten.kontakt.items() if value},
             }
-            return {
-                "status": "lieferant_unbekannt",
-                "meldung": f"Lieferant {daten.lieferant_name or daten.ust_id} ist in Odoo noch nicht angelegt.",
-                "lieferant_vorschlag": {key: value for key, value in vorschlag.items() if value},
+            data = {
+                "lieferant": {key: value for key, value in lieferant.items() if value},
+                **_card_fields(daten, cost_type),
+                "waehrung": daten.waehrung,
+                "betraege": betraege,
+                "dateinamen": [name for name, _ in files],
             }
-
-        bill_id = same[0]["id"] if same else None
-        created = bill_id is None
-        kategorie_hinweis = None
-        if created:
-            if not daten.summen:
-                return {
-                    "error": "betraege missing: read the net totals per tax rate from the invoice and call again",
-                    "status_code": 422,
-                }
-            cost_type = client.find_cost_type(rechnung.kategorie) if rechnung.kategorie else None
-            if rechnung.kategorie and cost_type is None:
-                kategorie_hinweis = (
-                    f"Kostenart {rechnung.kategorie!r} gibt es nicht; vorhanden: {', '.join(client.cost_type_names())}"
-                )
-            lines = []
-            for netto, prozent, steuer_name, waehlbar in daten.summen:
-                tax = client.resolve_purchase_tax(prozent, steuer_name) if waehlbar else None
-                label = f"Rechnung {daten.rechnungsnummer} – Gesamtbetrag {tax['name'] if tax else f'{prozent:g} %'}"
-                line = {"name": label + (f" – {cost_type['name']}" if cost_type else ""), "quantity": 1, "price_unit": netto}
-                if tax:
-                    line["tax_ids"] = [[6, 0, [tax["id"]]]]
-                if cost_type:
-                    line["analytic_distribution"] = {str(cost_type["id"]): 100}
-                lines.append(line)
-            bill_id = client.create_draft_vendor_bill(
-                partner_id=partner_id,
-                rechnungsnummer=daten.rechnungsnummer,
-                rechnungsdatum=daten.rechnungsdatum.isoformat(),
-                faelligkeitsdatum=daten.faelligkeitsdatum.isoformat() if daten.faelligkeitsdatum else None,
-                waehrung=daten.waehrung,
-                lines=lines,
+            request = approvals.create(
+                tenant_id,
+                action="odoo_rechnung_mit_lieferant_buchen",
+                resource_id=lieferant["name"],
+                data=data,
+                blobs=[blob for _, blob in files],
+                ttl=ODOO_APPROVAL_TTL,
+            )
+            return RechnungAblageDTO(
+                status="pending",
+                ergebnis="neuer_lieferant",
+                id=request.id,
+                message=(
+                    f"Neuer Lieferant {lieferant['name']}: anlegen und Rechnung {daten.rechnungsnummer} "
+                    f"über {gesamt} netto buchen?"
+                ),
+                payload=request.payload,
+                meldung=(
+                    f"Rechnung {daten.rechnungsnummer} von {lieferant['name']}: Lieferant ist neu, "
+                    "Freigabe zum Anlegen und Buchen angefragt."
+                ),
+                quelle=daten.quelle,
+                positionen=daten.positionen,
+                hinweis="; ".join(hinweise) or None,
             )
 
-        stored = [_attach_one(client, anhang, bill_id) for anhang in rechnung.anhaenge]
-        new_attachments = [item["attachment_id"] for item in stored if item["added"]]
-        hinweise = list(daten.hinweise) + ([kategorie_hinweis] if kategorie_hinweis else [])
-        if created and new_attachments:
-            # Shows the PDF next to the bill form. Never worth failing the store for.
-            try:
-                client.set_main_attachment(bill_id, new_attachments[0])
-            except OdooError as exc:
-                hinweise.append(f"Hauptanhang nicht gesetzt: {exc}")
+        bill_id, stored, more = _store_bill(
+            client,
+            partner_id=partner_id,
+            rechnungsnummer=daten.rechnungsnummer,
+            rechnungsdatum=daten.rechnungsdatum.isoformat(),
+            faelligkeitsdatum=daten.faelligkeitsdatum.isoformat() if daten.faelligkeitsdatum else None,
+            waehrung=daten.waehrung,
+            betraege=betraege,
+            cost_type=cost_type,
+            files=files,
+        )
+        hinweise += more
         total = client.bill_total(bill_id)
     except OdooError as exc:
-        return _error(exc)
+        return _failed(exc)
 
-    # Only after the bill is safe: a problem with the supplier's details must
-    # never cost the invoice.
-    printed = {**daten.kontakt, "ust_id": daten.ust_id}
-    filled: dict[str, str] = {}
-    differ: dict[str, dict] = {}
-    iban_warning = False
-    try:
-        filled, differ = _contact_changes(client.supplier_contact(partner_id), printed)
-        if filled:
-            client.update_supplier_contact(partner_id, filled)
-        if daten.iban:
-            known = client.supplier_ibans(partner_id)
-            iban_warning = bool(known) and _normalized_iban(daten.iban) not in known
-    except OdooError as exc:
-        filled = {}
-        hinweise.append(f"Kontaktdaten nicht ergänzt: {exc}")
-
-    amount = f" ({_euro(total)})" if total else ""
-    if created:
-        meldung = f"Rechnung {daten.rechnungsnummer} von {supplier['name']}{amount} als Entwurf in Odoo abgelegt."
-    else:
-        meldung = f"Rechnung {daten.rechnungsnummer} von {supplier['name']} war schon in Odoo."
+    filled, differ, iban_warning, more = _enrich_contact(client, partner_id, daten)
+    hinweise += more
+    amount = _euro(total) if total else gesamt
+    meldung = f"Rechnung {daten.rechnungsnummer} von {supplier['name']} ({amount}) als Entwurf abgelegt, Buchung angefragt."
     if filled:
         meldung += f" Beim Lieferanten ergänzt: {_labels(filled)}."
     if iban_warning:
@@ -576,25 +682,82 @@ def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
             " Achtung: Die Rechnung nennt eine andere IBAN als in Odoo hinterlegt. Bitte telefonisch "
             "beim Lieferanten prüfen, bevor bezahlt wird."
         )
-    result = {
-        "status": "abgelegt" if created else "bereits_vorhanden",
-        "meldung": meldung,
-        "rechnung_id": bill_id,
-        "lieferant_id": partner_id,
-        "quelle": daten.quelle,
-        "anhaenge": stored,
-    }
-    if daten.positionen:
-        result["positionen"] = daten.positionen
-    if differ:
-        result["abweichende_kontaktdaten"] = differ
-        result["naechster_schritt"] = (
+    # The bill's id goes in resource_id, which the card cannot edit - so a card
+    # can correct the number or a date but never point at another bill.
+    request = approvals.create(
+        tenant_id,
+        action="odoo_rechnung_buchen",
+        resource_id=str(bill_id),
+        data=_card_fields(daten, cost_type),
+        ttl=ODOO_APPROVAL_TTL,
+    )
+    return RechnungAblageDTO(
+        status="pending",
+        ergebnis="abgelegt",
+        id=request.id,
+        message=f"Rechnung {daten.rechnungsnummer} von {supplier['name']} über {amount} buchen?",
+        payload=request.payload,
+        meldung=meldung,
+        rechnung_id=bill_id,
+        lieferant_id=partner_id,
+        quelle=daten.quelle,
+        anhaenge=stored,
+        positionen=daten.positionen,
+        abweichende_kontaktdaten=differ,
+        naechster_schritt=(
             "call odoo_lieferant_aktualisieren with this lieferant_id and the new values, "
             "so a human can approve the change"
         )
-    if hinweise:
-        result["hinweis"] = "; ".join(hinweise)
-    return result
+        if differ
+        else None,
+        hinweis="; ".join(hinweise) or None,
+    )
+
+
+def _card_fields(daten: _Rechnungsdaten, cost_type: dict | None) -> dict:
+    """What a human may correct on the card before booking."""
+    return {
+        "rechnungsnummer": daten.rechnungsnummer,
+        "rechnungsdatum": daten.rechnungsdatum.isoformat(),
+        "faelligkeitsdatum": daten.faelligkeitsdatum.isoformat() if daten.faelligkeitsdatum else "",
+        "kostenart": cost_type["name"] if cost_type else "",
+    }
+
+
+def _enrich_contact(client: OdooClient, partner_id: int, daten: _Rechnungsdaten) -> tuple[dict, dict, bool, list[str]]:
+    """Only after the bill is safe: a problem with the supplier's details must
+    never cost the invoice."""
+    printed = {**daten.kontakt, "ust_id": daten.ust_id}
+    try:
+        filled, differ = _contact_changes(client.supplier_contact(partner_id), printed)
+        if filled:
+            client.update_supplier_contact(partner_id, filled)
+        iban_warning = False
+        if daten.iban:
+            known = client.supplier_ibans(partner_id)
+            iban_warning = bool(known) and _normalized_iban(daten.iban) not in known
+        return filled, differ, iban_warning, []
+    except OdooError as exc:
+        return {}, {}, False, [f"Kontaktdaten nicht ergänzt: {exc}"]
+
+
+def _card_values(data: dict, client: OdooClient) -> tuple[str, str, str | None, dict | None]:
+    """The card's (possibly corrected) fields, checked: a typo there fails the
+    booking instead of booking something odd."""
+    nummer = str(data.get("rechnungsnummer") or "").strip()
+    if not nummer:
+        raise OdooError(422, "Rechnungsnummer fehlt")
+    try:
+        datum = date.fromisoformat(str(data["rechnungsdatum"]).strip()).isoformat()
+        faellig_raw = str(data.get("faelligkeitsdatum") or "").strip()
+        faellig = date.fromisoformat(faellig_raw).isoformat() if faellig_raw else None
+    except ValueError as exc:
+        raise OdooError(422, f"Datum nicht lesbar (JJJJ-MM-TT): {exc}") from exc
+    kostenart = str(data.get("kostenart") or "").strip()
+    cost_type = client.find_cost_type(kostenart) if kostenart else None
+    if kostenart and cost_type is None:
+        raise OdooError(422, f"Kostenart {kostenart!r} gibt es nicht; vorhanden: {', '.join(client.cost_type_names())}")
+    return nummer, datum, faellig, cost_type
 
 
 def _attach_one(client: OdooClient, anhang: Anhang, bill_id: int) -> dict:
@@ -1047,3 +1210,96 @@ def odoo_einkaufspreise_aendern_execute(ctx: Context, approval_id: str) -> dict:
         error["bereits_geaendert"] = geaendert
         return error
     return {"geaendert": geaendert, "uebersprungen": uebersprungen}
+
+
+@mcp.tool()
+def odoo_rechnung_buchen_execute(ctx: Context, approval_id: str) -> dict:
+    """Book (post) the draft bill of an approved odoo_rechnung_ablegen card,
+    after applying any correction made on the card. Fails unless a human has
+    approved it; each approval works once. A bill no longer in draft is left
+    alone."""
+    try:
+        approval = approvals.consume_approved(approval_id, _resolve_tenant_id(ctx), "odoo_rechnung_buchen")
+    except (approvals.ApprovalNotFoundError, approvals.ApprovalStateError) as exc:
+        return _approval_error(exc, approval_id)
+    client = _odoo()
+    bill_id = int(approval.resource_id)
+    try:
+        nummer, datum, faellig, cost_type = _card_values(approval.data, client)
+        bill = client.get_one("account.move", bill_id, ["state", "ref", "invoice_date", "invoice_date_due"])
+        if bill is None:
+            raise OdooError(404, f"bill {bill_id} not found")
+        if bill["state"] != "draft":
+            raise OdooError(409, f"bill {bill_id} is {bill['state']}, not a draft any more")
+        changes = {
+            key: value
+            for key, value in (("ref", nummer), ("invoice_date", datum), ("invoice_date_due", faellig))
+            if value and value != bill.get(key)
+        }
+        client.update_draft_bill(bill_id, changes, cost_type["id"] if cost_type else None)
+        name = client.post_bill(bill_id)
+    except OdooError as exc:
+        error = _error(exc)
+        error["hinweis"] = "Die Rechnung bleibt als Entwurf in Odoo und kann dort gebucht werden."
+        return error
+    return {"rechnung_id": bill_id, "gebucht_als": name, "meldung": f"Rechnung {nummer} gebucht ({name})."}
+
+
+@mcp.tool()
+def odoo_rechnung_mit_lieferant_buchen_execute(ctx: Context, approval_id: str) -> dict:
+    """Create the supplier, store and book the invoice of an approved
+    odoo_rechnung_ablegen card for a new supplier. Fails unless a human has
+    approved it; each approval works once. If the supplier or the invoice turns
+    out to exist by now, they are reused, not created twice."""
+    try:
+        approval = approvals.consume_approved(
+            approval_id, _resolve_tenant_id(ctx), "odoo_rechnung_mit_lieferant_buchen"
+        )
+    except (approvals.ApprovalNotFoundError, approvals.ApprovalStateError) as exc:
+        return _approval_error(exc, approval_id)
+    client = _odoo()
+    bill_id = None
+    try:
+        lieferant = Lieferant.model_validate(approval.data["lieferant"])
+        nummer, datum, faellig, cost_type = _card_values(approval.data, client)
+        betraege = [
+            {"netto": float(b["netto"]), "steuer": str(b.get("steuer") or "").strip()}
+            for b in approval.data["betraege"]
+        ]
+        partner_id, _ = client.match_supplier(lieferant.name, lieferant.ust_id)
+        supplier_created = partner_id is None
+        if supplier_created:
+            partner_id = client.create_supplier(**lieferant.model_dump())
+        existing = [bill for bill in client.find_bills_by_ref(nummer) if bill["partner_id"] == partner_id]
+        if existing:
+            bill_id = existing[0]["id"]
+        else:
+            names = approval.data.get("dateinamen") or [f"rechnung-{i + 1}.pdf" for i in range(len(approval.blobs))]
+            bill_id, _, _ = _store_bill(
+                client,
+                partner_id=partner_id,
+                rechnungsnummer=nummer,
+                rechnungsdatum=datum,
+                faelligkeitsdatum=faellig,
+                waehrung=str(approval.data.get("waehrung") or "EUR"),
+                betraege=betraege,
+                cost_type=cost_type,
+                files=list(zip([safe_filename(n) for n in names], approval.blobs)),
+            )
+        name = client.post_bill(bill_id)
+    except (ValidationError, ValueError, KeyError) as exc:
+        return {"error": f"invalid data after approval: {exc}", "status_code": 422}
+    except OdooError as exc:
+        error = _error(exc)
+        if bill_id is not None:
+            error["rechnung_id"] = bill_id
+            error["hinweis"] = "Die Rechnung liegt als Entwurf in Odoo und kann dort gebucht werden."
+        return error
+    approvals.discard_blobs(approval)
+    return {
+        "lieferant_id": partner_id,
+        "lieferant_angelegt": supplier_created,
+        "rechnung_id": bill_id,
+        "gebucht_als": name,
+        "meldung": f"Lieferant {lieferant.name} {'angelegt' if supplier_created else 'gefunden'}, Rechnung {nummer} gebucht ({name}).",
+    }

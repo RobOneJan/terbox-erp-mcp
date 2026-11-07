@@ -28,6 +28,13 @@ from terbox_mcp.odoo_models import (
     VerkaufspreisRequest,
 )
 
+
+def _ablegen(rechnung, ctx=None) -> dict:
+    """odoo_rechnung_ablegen as a plain dict of the fields it set."""
+    from types import SimpleNamespace as _NS
+
+    return odoo_tools.odoo_rechnung_ablegen(ctx or _NS(headers=None), rechnung).model_dump(exclude_defaults=True)
+
 PDF = b"%PDF-1.7 test invoice"
 PDF_B64 = base64.b64encode(PDF).decode()
 TENANT = approvals.DEFAULT_TENANT_ID
@@ -200,13 +207,15 @@ def test_overview_keeps_other_sections_when_one_fails(odoo: FakeOdoo) -> None:
 # --- supplier invoices -------------------------------------------------------
 
 
-def test_invoice_of_known_supplier_is_stored_without_approval(odoo: FakeOdoo) -> None:
+def test_invoice_of_known_supplier_is_stored_as_draft_and_one_card_asks_to_book_it(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
 
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung())
+    result = _ablegen(_rechnung())
 
-    assert result["status"] == "abgelegt"
-    assert result["meldung"] == "Rechnung RE-1 von Zaunbau Müller GmbH (3.684,24 €) als Entwurf in Odoo abgelegt."
+    assert result["ergebnis"] == "abgelegt"
+    assert result["status"] == "pending"
+    assert result["message"] == "Rechnung RE-1 von Zaunbau Müller GmbH über 3.684,24 € buchen?"
+    assert "als Entwurf abgelegt, Buchung angefragt" in result["meldung"]
     vals = odoo.body_of("account.move", "create")["vals_list"][0]
     assert vals["move_type"] == "in_invoice"
     assert vals["partner_id"] == 26
@@ -218,29 +227,146 @@ def test_invoice_of_known_supplier_is_stored_without_approval(odoo: FakeOdoo) ->
     attachment = odoo.body_of("ir.attachment", "create")["vals_list"][0]
     assert base64.b64decode(attachment["raw"]) == PDF
     assert "datas" not in attachment  # the field no longer exists on saas~19.4
-    # Never posted, nothing pending.
-    assert {call[1] for call in odoo.calls} <= {"read", "search_read", "create", "write"}
-    assert approvals._store == {}
+    # Not booked yet: that waits for the card.
+    assert ("account.move", "action_post") not in [(m, n) for m, n, _ in odoo.calls]
+    # The card can correct number, dates and cost type - never which bill it is.
+    assert set(result["payload"]) == {"rechnungsnummer", "rechnungsdatum", "faelligkeitsdatum", "kostenart"}
+    assert approvals.get(result["id"], TENANT).resource_id == str(result["rechnung_id"])
+
+
+def _bill_in_odoo(odoo: FakeOdoo, **fields) -> None:
+    row = {"id": 1001, "state": "draft", "ref": "RE-1", "invoice_date": "2026-10-20", "invoice_date_due": False, "name": "/"}
+    row.update(fields)
+
+    def read(body: dict) -> list[dict]:
+        return [{**row, "amount_total": 3684.24}]
+
+    odoo.responses[("account.move", "read")] = read
+
+
+def test_approving_the_card_books_the_draft(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    pending = _ablegen(_rechnung())
+    approvals.decide(pending["id"], TENANT, approve=True, edits=dict(pending["payload"]))
+    _bill_in_odoo(odoo)
+
+    def posted(body: dict) -> bool:
+        _bill_in_odoo(odoo, state="posted", name="BILL/2026/11/0001")
+        return True
+
+    odoo.responses[("account.move", "action_post")] = posted
+
+    result = odoo_tools.odoo_rechnung_buchen_execute(_ctx(), pending["id"])
+
+    assert result["gebucht_als"] == "BILL/2026/11/0001"
+    assert odoo.body_of("account.move", "action_post") == {"ids": [pending["rechnung_id"]]}
+    assert odoo_tools.odoo_rechnung_buchen_execute(_ctx(), pending["id"])["status_code"] == 409
+
+
+def test_corrections_on_the_card_are_applied_before_booking(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    odoo.responses[("account.analytic.account", "search_read")] = [
+        {"id": 3, "name": "Werkzeuge & Betriebsmittel", "plan_id": [4, "Kostenarten / Gemeinkosten"]}
+    ]
+    pending = _ablegen(_rechnung())
+    approvals.decide(
+        pending["id"],
+        TENANT,
+        approve=True,
+        edits={"rechnungsnummer": "RE-1a", "faelligkeitsdatum": "2026-11-30", "kostenart": "Werkzeuge & Betriebsmittel"},
+    )
+    _bill_in_odoo(odoo)
+    odoo.responses[("account.move.line", "search_read")] = [{"id": 7}]
+    odoo.responses[("account.move", "action_post")] = lambda body: _bill_in_odoo(odoo, state="posted", name="B/1") or True
+
+    odoo_tools.odoo_rechnung_buchen_execute(_ctx(), pending["id"])
+
+    move_writes = [body for m, n, body in odoo.calls if (m, n) == ("account.move", "write")]
+    assert {"ids": [pending["rechnung_id"]], "vals": {"ref": "RE-1a", "invoice_date_due": "2026-11-30"}} in move_writes
+    line_write = odoo.body_of("account.move.line", "write")
+    assert line_write == {"ids": [7], "vals": {"analytic_distribution": {"3": 100}}}
+    calls = [(m, n) for m, n, _ in odoo.calls]
+    assert calls.index(("account.move.line", "write")) < calls.index(("account.move", "action_post"))
+
+
+def test_a_typo_on_the_card_fails_instead_of_booking_something_odd(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    pending = _ablegen(_rechnung())
+    approvals.decide(pending["id"], TENANT, approve=True, edits={"rechnungsdatum": "20.10.2026"})
+    _bill_in_odoo(odoo)
+
+    result = odoo_tools.odoo_rechnung_buchen_execute(_ctx(), pending["id"])
+
+    assert result["status_code"] == 422
+    assert "Entwurf" in result["hinweis"]
+    assert ("account.move", "action_post") not in [(m, n) for m, n, _ in odoo.calls]
+
+
+def test_a_bill_no_longer_in_draft_is_left_alone(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    pending = _ablegen(_rechnung())
+    approvals.decide(pending["id"], TENANT, approve=True)
+    _bill_in_odoo(odoo, state="posted")
+
+    result = odoo_tools.odoo_rechnung_buchen_execute(_ctx(), pending["id"])
+
+    assert result["status_code"] == 409
+    assert ("account.move", "action_post") not in [(m, n) for m, n, _ in odoo.calls]
+
+
+def test_rejecting_the_card_leaves_the_draft(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    pending = _ablegen(_rechnung())
+    approvals.decide(pending["id"], TENANT, approve=False)
+    assert odoo_tools.odoo_rechnung_buchen_execute(_ctx(), pending["id"])["status_code"] == 409
+    assert ("account.move", "unlink") not in odoo.writes()
+
+
+def test_new_supplier_one_card_creates_it_stores_and_books(odoo: FakeOdoo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "SUPPLIERS", [])
+    _odoo_for_bills(odoo)
+
+    pending = _ablegen(_rechnung(lieferant_name="Neu GmbH", ust_id="DE999999999"))
+
+    assert pending["ergebnis"] == "neuer_lieferant"
+    assert pending["status"] == "pending"
+    assert "Neuer Lieferant Neu GmbH: anlegen und Rechnung RE-1" in pending["message"]
+    assert pending["payload"]["lieferant.ust_id"] == "DE999999999"
+    assert pending["payload"]["betraege[0].steuer"] == "19% I"
+    assert odoo.writes() == []  # nothing before the human decides
+
+    approvals.decide(pending["id"], TENANT, approve=True, edits=dict(pending["payload"]))
+    odoo.responses[("account.move", "read")] = [{"id": 1, "state": "posted", "name": "BILL/1"}]
+
+    result = odoo_tools.odoo_rechnung_mit_lieferant_buchen_execute(_ctx(), pending["id"])
+
+    assert result["lieferant_angelegt"] is True
+    assert result["gebucht_als"] == "BILL/1"
+    calls = [(m, n) for m, n, _ in odoo.calls]
+    assert calls.index(("res.partner", "create")) < calls.index(("account.move", "create"))
+    assert calls.index(("ir.attachment", "create")) < calls.index(("account.move", "action_post"))
+    assert base64.b64decode(odoo.body_of("ir.attachment", "create")["vals_list"][0]["raw"]) == PDF
+    assert odoo_tools.odoo_rechnung_mit_lieferant_buchen_execute(_ctx(), pending["id"])["status_code"] == 409
 
 
 def test_supplier_is_found_by_vat_id_whatever_its_name(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(lieferant_name="ZM Zaunsysteme", ust_id="DE 123 456 789"))
+    result = _ablegen(_rechnung(lieferant_name="ZM Zaunsysteme", ust_id="DE 123 456 789"))
     assert result["lieferant_id"] == 26
 
 
 def test_supplier_is_found_when_the_invoice_prints_more_than_odoo_stores(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(lieferant_name="Zaunbau Müller GmbH, Inh. Hans Müller"))
+    result = _ablegen(_rechnung(lieferant_name="Zaunbau Müller GmbH, Inh. Hans Müller"))
     assert result["lieferant_id"] == 26
 
 
 def test_unknown_supplier_stores_nothing(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
 
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(lieferant_name="Neu GmbH"))
+    result = _ablegen(_rechnung(lieferant_name="Neu GmbH"))
 
-    assert result["status"] == "lieferant_unbekannt"
+    assert result["ergebnis"] == "neuer_lieferant"
     assert odoo.writes() == []
 
 
@@ -252,7 +378,7 @@ def test_ambiguous_supplier_lists_candidates_and_stores_nothing(odoo: FakeOdoo, 
     )
     _odoo_for_bills(odoo)
 
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung())
+    result = _ablegen(_rechnung())
 
     assert result["status"] == "lieferant_unklar"
     assert {c["lieferant_id"] for c in result["kandidaten"]} == {26, 27}
@@ -261,7 +387,7 @@ def test_ambiguous_supplier_lists_candidates_and_stores_nothing(odoo: FakeOdoo, 
 
 def test_invoice_never_lands_on_a_partner_that_is_not_a_supplier(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(lieferant_name=None, lieferant_id=99))
+    result = _ablegen(_rechnung(lieferant_name=None, lieferant_id=99))
     assert result["status_code"] == 404
     assert odoo.writes() == []
 
@@ -271,9 +397,9 @@ def test_same_invoice_twice_is_not_created_again(odoo: FakeOdoo) -> None:
     odoo.responses[("account.move", "search_read")] = [{"id": 77, "partner_id": [26, "Zaunbau Müller GmbH"]}]
     odoo.responses[("ir.attachment", "search_read")] = [{"id": 3}]
 
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung())
+    result = _ablegen(_rechnung())
 
-    assert result["status"] == "bereits_vorhanden"
+    assert result["ergebnis"] == "bereits_vorhanden"
     assert result["rechnung_id"] == 77
     assert odoo.writes() == []
 
@@ -281,7 +407,7 @@ def test_same_invoice_twice_is_not_created_again(odoo: FakeOdoo) -> None:
 def test_invoice_is_never_stored_without_its_amounts(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
 
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(betraege=[]))
+    result = _ablegen(_rechnung(betraege=[]))
 
     assert result["status_code"] == 422
     assert "betraege" in result["error"]
@@ -290,7 +416,7 @@ def test_invoice_is_never_stored_without_its_amounts(odoo: FakeOdoo) -> None:
 
 def test_reverse_charge_tax_is_used_when_named(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
-    odoo_tools.odoo_rechnung_ablegen(_rechnung(betraege=[{"netto": 100, "steuer_prozent": 19, "steuer_name": "19% EU"}]))
+    _ablegen(_rechnung(betraege=[{"netto": 100, "steuer_prozent": 19, "steuer_name": "19% EU"}]))
     tax_lookup = odoo.body_of("account.tax", "search_read")
     assert ["name", "=", "19% EU"] in tax_lookup["domain"]
 
@@ -299,7 +425,7 @@ def test_corrupted_upload_is_removed_and_reported(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
     odoo.stored_checksum = "not-the-real-sha1"
 
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung())
+    result = _ablegen(_rechnung())
 
     assert "corrupted" in result["error"]
     assert ("ir.attachment", "unlink") in odoo.writes()
@@ -378,7 +504,7 @@ def test_missing_contact_details_are_added_to_the_supplier(odoo: FakeOdoo) -> No
     _odoo_for_bills(odoo)
     _supplier_in_odoo(odoo)
 
-    result = odoo_tools.odoo_rechnung_ablegen(
+    result = _ablegen(
         _rechnung(
             ust_id="DE 111 222 333",
             kontakt={"email": "buchhaltung@zaunbau.de", "strasse": "Weg 1", "plz": "45127", "ort": "Essen"},
@@ -400,7 +526,7 @@ def test_existing_contact_details_are_never_overwritten(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
     _supplier_in_odoo(odoo, email="info@zaunbau.de", street="Alte Str. 5", zip="45127", city="Essen")
 
-    result = odoo_tools.odoo_rechnung_ablegen(
+    result = _ablegen(
         _rechnung(kontakt={"email": "neu@zaunbau.de", "telefon": "0201 123", "strasse": "Neue Str. 9"})
     )
 
@@ -409,14 +535,14 @@ def test_existing_contact_details_are_never_overwritten(odoo: FakeOdoo) -> None:
         "email": {"bisher": "info@zaunbau.de", "neu": "neu@zaunbau.de"},
         "strasse": {"bisher": "Alte Str. 5", "neu": "Neue Str. 9"},
     }
-    assert result["status"] == "abgelegt"
+    assert result["ergebnis"] == "abgelegt"
 
 
 def test_same_detail_written_differently_is_not_a_change(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
     _supplier_in_odoo(odoo, email="Info@Zaunbau.de", phone="+49 201 123456", vat="DE111222333", city="Essen")
 
-    result = odoo_tools.odoo_rechnung_ablegen(
+    result = _ablegen(
         _rechnung(ust_id="de 111222333", kontakt={"email": "info@zaunbau.de ", "telefon": "0201 / 123456", "ort": "ESSEN"})
     )
 
@@ -429,7 +555,7 @@ def test_same_detail_written_differently_is_not_a_change(odoo: FakeOdoo) -> None
 def test_street_spellings_are_one_address(odoo: FakeOdoo, printed: str) -> None:
     _odoo_for_bills(odoo)
     _supplier_in_odoo(odoo, street="Hansestraße 36", zip="51688", city="Wipperfürth")
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(kontakt={"strasse": printed, "plz": "51688"}))
+    result = _ablegen(_rechnung(kontakt={"strasse": printed, "plz": "51688"}))
     assert "abweichende_kontaktdaten" not in result
     assert _supplier_write(odoo) is None
 
@@ -439,7 +565,7 @@ def test_differing_iban_only_warns_and_is_never_stored(odoo: FakeOdoo) -> None:
     _supplier_in_odoo(odoo)
     odoo.responses[("res.partner.bank", "search_read")] = [{"id": 1, "sanitized_account_number": "DE89370400440532013000"}]
 
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(iban="DE02 1203 0000 0000 2020 51"))
+    result = _ablegen(_rechnung(iban="DE02 1203 0000 0000 2020 51"))
 
     assert "andere IBAN" in result["meldung"]
     assert all(model != "res.partner.bank" for model, _ in odoo.writes())
@@ -450,7 +576,7 @@ def test_matching_iban_gives_no_warning(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
     _supplier_in_odoo(odoo)
     odoo.responses[("res.partner.bank", "search_read")] = [{"id": 1, "sanitized_account_number": "DE89370400440532013000"}]
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(iban="de89 3704 0044 0532 0130 00"))
+    result = _ablegen(_rechnung(iban="de89 3704 0044 0532 0130 00"))
     assert "IBAN" not in result["meldung"]
 
 
@@ -459,9 +585,9 @@ def test_contact_problem_never_costs_the_invoice(odoo: FakeOdoo) -> None:
     _supplier_in_odoo(odoo)
     odoo.responses[("res.partner", "write")] = httpx.Response(400, json={"message": "invalid VAT number"})
 
-    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(ust_id="XX-not-a-vat"))
+    result = _ablegen(_rechnung(ust_id="XX-not-a-vat"))
 
-    assert result["status"] == "abgelegt"
+    assert result["ergebnis"] == "abgelegt"
     assert ("account.move", "create") in odoo.writes()
     assert "Kontaktdaten nicht ergänzt" in result["hinweis"]
     assert "ergänzt:" not in result["meldung"]
@@ -831,7 +957,7 @@ async def test_pending_approval_is_detectable_by_agent_hub(odoo: FakeOdoo) -> No
     assert isinstance(data["message"], str)
 
 
-async def test_invoice_result_reaches_agent_hub_as_plain_text_not_an_approval(odoo: FakeOdoo) -> None:
+async def test_booking_card_is_detectable_by_agent_hub(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
     result = await server.mcp.call_tool(
         "odoo_rechnung_ablegen",
@@ -845,10 +971,11 @@ async def test_invoice_result_reaches_agent_hub_as_plain_text_not_an_approval(od
             }
         },
     )
-    text = "\n".join(block.text for block in result.content if block.type == "text")
-    assert "als Entwurf in Odoo abgelegt" in text
-    assert PDF_B64 not in text
-    assert (result.structured_content or {}).get("status") != "pending"
+    data = result.structured_content
+    assert data["status"] == "pending"
+    assert isinstance(data["id"], str) and isinstance(data["message"], str)
+    assert data["ergebnis"] == "abgelegt"
+    assert PDF_B64 not in json.dumps(data)
 
 
 async def test_supplier_approval_is_detectable_by_agent_hub(odoo: FakeOdoo, monkeypatch: pytest.MonkeyPatch) -> None:

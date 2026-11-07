@@ -9,8 +9,8 @@ Two deliberately different halves:
   here rather than in the Odoo user's rights alone.
 - Writes are NOT generic. There is one typed method per permitted action and no
   way to reach `create`/`write` on an arbitrary model through this class. Bills
-  are only ever created as drafts; nothing here posts, pays or deletes business
-  records.
+  are created as drafts and booked only with a human's approval (post_bill);
+  nothing here pays or deletes business records.
 
 Every JSON-2 call runs in its own Odoo transaction, so multi-step writes are not
 atomic. Rule used throughout: look up before writing, so retries are safe.
@@ -544,6 +544,39 @@ class OdooClient:
                 }
             ),
         )
+
+    def resolve_purchase_tax_by_name(self, name: str) -> dict:
+        rows = self.search_read(
+            "account.tax", [["type_tax_use", "=", "purchase"], ["name", "=", name.strip()]], ["name", "amount"], limit=1
+        )
+        if not rows:
+            raise OdooError(404, f"no purchase tax named {name!r} found")
+        return rows[0]
+
+    def update_draft_bill(self, bill_id: int, vals: dict, cost_type_id: int | None) -> None:
+        """Corrections from an approval card, applied before booking."""
+        if vals:
+            self._call("account.move", "write", ids=[bill_id], vals=vals)
+        if cost_type_id is not None:
+            lines = self.search_read(
+                "account.move.line", [["move_id", "=", bill_id], ["display_type", "=", "product"]], ["id"], limit=MAX_LIMIT
+            )
+            if lines:
+                self._call(
+                    "account.move.line",
+                    "write",
+                    ids=[line["id"] for line in lines],
+                    vals={"analytic_distribution": {str(cost_type_id): 100}},
+                )
+
+    def post_bill(self, bill_id: int) -> str:
+        """Book a draft vendor bill; returns the number Odoo gave it. Only ever
+        called with a human's approval."""
+        self._call("account.move", "action_post", ids=[bill_id])
+        rows = self.read("account.move", [bill_id], ["state", "name"])
+        if not rows or rows[0].get("state") != "posted":
+            raise OdooError(502, f"bill {bill_id} was not booked (state {rows[0].get('state') if rows else '?'})")
+        return rows[0].get("name") or str(bill_id)
 
     def set_main_attachment(self, bill_id: int, attachment_id: int) -> None:
         self._call("account.move", "write", ids=[bill_id], vals={"message_main_attachment_id": attachment_id})

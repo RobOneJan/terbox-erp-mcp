@@ -24,14 +24,22 @@ Credentials and security models (`DENIED_MODELS`) and secret or binary fields
 when used only in a domain filter, grouping or sort order. Custom read methods
 on individual models are not exposed, only the generic ones (`READ_METHODS`).
 
-**Supplier invoices** go to `odoo_rechnung_ablegen` without approval: it finds
-the supplier from name or VAT id and stores a draft bill with the PDF and one
-total line per tax rate, never the individual items, and never posts it. It is
-never stored without amounts. It first checks whether the invoice number is
-already in Odoo for any supplier. An optional cost type (`kategorie`, an analytic
-account of the plan "Kostenarten", split into Einzelkosten and Gemeinkosten)
-goes on the line for internal overhead reporting; the financial account stays
-Odoo's own choice. Only known suppliers qualify.
+**Supplier invoices** go to `odoo_rechnung_ablegen`, and one approval covers
+storing and booking:
+
+- Known supplier: the draft bill is stored right away (PDF, one total line per
+  tax rate, never the individual items, optional cost type), so nothing is lost
+  if a card is left lying. One card asks to book it; approving calls
+  `odoo_rechnung_buchen_execute`, rejecting leaves the draft.
+- New supplier: nothing is stored yet. One card shows the supplier and the
+  invoice; approving calls `odoo_rechnung_mit_lieferant_buchen_execute`, which
+  creates the supplier, stores and books the invoice.
+
+The card can correct number, dates, cost type (and for a new supplier its
+details and the totals); the bill it books is fixed in the approval itself, so
+an edit can never point it at another bill. A bill is never stored without
+amounts, and the invoice number is first checked against Odoo for any
+supplier. Repeating it for the same invoice creates nothing twice.
 
 For e-invoices (ZUGFeRD / Factur-X / XRechnung, embedded in the PDF or as an XML
 file; see `einvoice.py`) the data in the file wins over what the agent read:
@@ -39,9 +47,7 @@ number, dates, totals per tax rate, VAT id, contact details and IBAN. Its items
 come back so the agent can compare them with stored prices
 (`odoo_preise_pruefen`) and request all changes on one card
 (`odoo_einkaufspreise_aendern`). Odoo's own e-invoice import is not used: it
-creates every item line and stores the invoice's IBAN as a bank account. For an unknown one the agent asks for approval to
-create it (`odoo_lieferant_anlegen`), then stores the invoice. Repeating it for
-the same invoice creates nothing twice.
+creates every item line and stores the invoice's IBAN as a bank account.
 
 Contact details on the invoice or in its email (e-mail, phone, VAT id, address)
 are added to the supplier where Odoo has none; existing values are never
@@ -55,7 +61,7 @@ There is no generic write.
 
 | Prepare tool | Effect after approval |
 | --- | --- |
-| `odoo_lieferant_anlegen` | New supplier with the details from its invoice. |
+| `odoo_lieferant_anlegen` | New supplier without an invoice (with one, `odoo_rechnung_ablegen` covers it). |
 | `odoo_lieferant_aktualisieren` | Changes a supplier's differing contact details. |
 | `odoo_anhang_ablegen` | Files on an invoice, order, partner or product. |
 | `odoo_material_anlegen` | New article, optionally with supplier and price. |
