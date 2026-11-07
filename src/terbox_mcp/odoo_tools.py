@@ -23,14 +23,15 @@ from terbox_mcp import approvals
 from terbox_mcp.models import ApprovalStatusDTO, PendingApprovalDTO
 from terbox_mcp.odoo_client import DEFAULT_LIMIT, OdooClient, OdooError
 from terbox_mcp.odoo_models import (
+    Anhang,
     AnhangAblageDaten,
     AnhangAblageRequest,
     AttachmentDTO,
-    EingangsrechnungDaten,
-    EingangsrechnungRequest,
+    Lieferant,
     EinkaufspreisRequest,
     MaterialRequest,
     PreisPruefPosition,
+    RechnungAblageRequest,
     VerkaufspreisRequest,
     safe_filename,
     sniff_content_type,
@@ -273,6 +274,156 @@ def odoo_freigabe_status(ctx: Context, approval_id: str) -> ApprovalStatusDTO | 
     return ab1000_approval_status(ctx, approval_id)
 
 
+# --- supplier invoices: stored right away, a new supplier needs approval ------
+
+
+def _euro(amount: float) -> str:
+    return f"{amount:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+@mcp.tool()
+def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
+    """Store a supplier invoice in Odoo right away: a DRAFT bill with the file
+    attached and one total line per tax rate, never the individual items.
+
+    Finds the supplier itself from lieferant_name / ust_id. Only for known
+    suppliers; status "lieferant_unbekannt" means call odoo_lieferant_anlegen
+    with the supplier details from the invoice, then call this tool again once
+    that is approved. "lieferant_unklar" lists candidates: call again with the
+    right lieferant_id. Repeating it for the same invoice creates nothing twice.
+    After "abgelegt" or "bereits_vorhanden", reply with just the returned meldung.
+    """
+    client = _odoo()
+    try:
+        if rechnung.lieferant_id is not None:
+            supplier = client.get_supplier(rechnung.lieferant_id)
+            if supplier is None:
+                raise OdooError(404, f"partner {rechnung.lieferant_id} is not a supplier")
+            partner_id = rechnung.lieferant_id
+        else:
+            partner_id, candidates = client.match_supplier(rechnung.lieferant_name, rechnung.ust_id)
+            if partner_id is None and candidates:
+                return {
+                    "status": "lieferant_unklar",
+                    "kandidaten": [{"lieferant_id": row["id"], "name": row["name"]} for row in candidates],
+                }
+            if partner_id is None:
+                return {
+                    "status": "lieferant_unbekannt",
+                    "meldung": f"Lieferant {rechnung.lieferant_name or rechnung.ust_id} ist in Odoo noch nicht angelegt.",
+                }
+            supplier = client.get_supplier(partner_id)
+            if supplier is None:
+                raise OdooError(409, f"partner {partner_id} matches the invoice but is not marked as a supplier")
+
+        bill_id = client.find_vendor_bill(partner_id, rechnung.rechnungsnummer)
+        created = bill_id is None
+        if created:
+            lines = []
+            for betrag in rechnung.betraege:
+                tax = client.resolve_purchase_tax(betrag.steuer_prozent, betrag.steuer_name)
+                lines.append(
+                    {
+                        "name": f"Rechnung {rechnung.rechnungsnummer} – Gesamtbetrag {tax['name']}",
+                        "quantity": 1,
+                        "price_unit": betrag.netto,
+                        "tax_ids": [[6, 0, [tax["id"]]]],
+                    }
+                )
+            bill_id = client.create_draft_vendor_bill(
+                partner_id=partner_id,
+                rechnungsnummer=rechnung.rechnungsnummer,
+                rechnungsdatum=rechnung.rechnungsdatum.isoformat(),
+                faelligkeitsdatum=rechnung.faelligkeitsdatum.isoformat() if rechnung.faelligkeitsdatum else None,
+                waehrung=rechnung.waehrung,
+                lines=lines,
+            )
+
+        stored = [_attach_one(client, anhang, bill_id) for anhang in rechnung.anhaenge]
+        new_attachments = [item["attachment_id"] for item in stored if item["added"]]
+        hinweis = None
+        if created and new_attachments:
+            # Shows the PDF next to the bill form. Never worth failing the store for.
+            try:
+                client.set_main_attachment(bill_id, new_attachments[0])
+            except OdooError as exc:
+                hinweis = f"Hauptanhang nicht gesetzt: {exc}"
+        total = client.bill_total(bill_id)
+    except OdooError as exc:
+        return _error(exc)
+
+    amount = f" ({_euro(total)})" if total else ""
+    if created:
+        meldung = f"Rechnung {rechnung.rechnungsnummer} von {supplier['name']}{amount} als Entwurf in Odoo abgelegt."
+    else:
+        meldung = f"Rechnung {rechnung.rechnungsnummer} von {supplier['name']} war schon in Odoo."
+    result = {
+        "status": "abgelegt" if created else "bereits_vorhanden",
+        "meldung": meldung,
+        "rechnung_id": bill_id,
+        "lieferant_id": partner_id,
+        "anhaenge": stored,
+    }
+    if hinweis:
+        result["hinweis"] = hinweis
+    return result
+
+
+def _attach_one(client: OdooClient, anhang: Anhang, bill_id: int) -> dict:
+    blob = anhang.raw()
+    content_type = sniff_content_type(blob) or "application/octet-stream"
+    return {"dateiname": anhang.dateiname, **client.attach("account.move", bill_id, anhang.dateiname, blob, content_type)}
+
+
+@mcp.tool()
+def odoo_lieferant_anlegen(ctx: Context, lieferant: Lieferant) -> PendingApprovalDTO:
+    """Request human approval to create a new supplier in Odoo, with the details
+    printed on its invoice. Writes nothing yet. Fails if the supplier exists.
+    Once approved, call odoo_lieferant_anlegen_execute, then odoo_rechnung_ablegen
+    with the returned lieferant_id."""
+    partner_id, candidates = _odoo().match_supplier(lieferant.name, lieferant.ust_id)
+    if partner_id is not None:
+        raise OdooError(409, f"supplier already exists (lieferant_id {partner_id})")
+    if candidates:
+        names = ", ".join(f"{row['name']} ({row['id']})" for row in candidates)
+        raise OdooError(409, f"similar suppliers exist, check whether one is meant: {names}")
+    request = approvals.create(
+        _resolve_tenant_id(ctx),
+        action="odoo_lieferant_anlegen",
+        resource_id=lieferant.name,
+        data=lieferant.model_dump(exclude_none=True),
+        ttl=ODOO_APPROVAL_TTL,
+    )
+    return _pending_response(request, f"Neuer Lieferant: {lieferant.name} in Odoo anlegen?")
+
+
+@mcp.tool()
+def odoo_lieferant_anlegen_execute(ctx: Context, approval_id: str) -> dict:
+    """Create the supplier of an approved odoo_lieferant_anlegen request. Fails
+    unless a human has approved it; each approval works once."""
+    try:
+        approval = approvals.consume_approved(approval_id, _resolve_tenant_id(ctx), "odoo_lieferant_anlegen")
+    except (approvals.ApprovalNotFoundError, approvals.ApprovalStateError) as exc:
+        return _approval_error(exc, approval_id)
+    try:
+        lieferant = Lieferant.model_validate(approval.data)
+    except ValidationError as exc:
+        return _invalid(exc)
+    client = _odoo()
+    try:
+        partner_id, _ = client.match_supplier(lieferant.name, lieferant.ust_id)
+        created = partner_id is None
+        if created:
+            partner_id = client.create_supplier(**lieferant.model_dump())
+    except OdooError as exc:
+        return _error(exc)
+    return {
+        "lieferant_id": partner_id,
+        "angelegt": created,
+        "naechster_schritt": "call odoo_rechnung_ablegen with this lieferant_id",
+    }
+
+
 # --- writes: prepare (no Odoo write happens here) ---------------------------
 
 
@@ -298,57 +449,11 @@ def _attach_all(client: OdooClient, request: approvals.ApprovalRequest, meta: li
 
 
 @mcp.tool()
-def odoo_eingangsrechnung_anlegen(ctx: Context, rechnung: EingangsrechnungRequest) -> PendingApprovalDTO:
-    """Request human approval to store a supplier invoice in Odoo as a DRAFT with
-    its file(s) attached. Writes nothing yet.
-
-    Look up the supplier first (odoo_namen_suchen on res.partner) and pass
-    lieferant_id; use lieferant only for a genuinely new one. With steuer_prozent
-    the tax is resolved to a concrete Odoo tax shown on the card; set steuer_name
-    for non-domestic suppliers. Once approved, call
-    odoo_eingangsrechnung_anlegen_execute. Bills are never posted here: booking
-    stays a human decision inside Odoo.
-    """
-    client = _odoo()
-    data = rechnung.model_dump(mode="json", exclude_none=True, exclude={"anhaenge"})
-    for position in data["positionen"]:
-        if "steuer_prozent" in position:
-            tax = client.resolve_purchase_tax(position["steuer_prozent"], position.get("steuer_name"))
-            position["steuer_name"] = tax["name"]
-    note = ""
-    if rechnung.lieferant_id is not None:
-        supplier = client.get_one("res.partner", rechnung.lieferant_id, ["name"])
-        if supplier is None:
-            raise OdooError(404, f"supplier {rechnung.lieferant_id} not found")
-        supplier_name = supplier["name"]
-        data["lieferant_name"] = supplier_name
-        existing = client.find_vendor_bill(rechnung.lieferant_id, rechnung.rechnungsnummer)
-        if existing:
-            note = f" Diese Rechnung existiert bereits (id {existing}); es werden nur fehlende Anhänge ergänzt."
-    else:
-        supplier_name = rechnung.lieferant.name
-        if client.find_supplier(supplier_name, rechnung.lieferant.ust_id) is None:
-            note = " Der Lieferant wird neu angelegt."
-    data["anhaenge"], blobs = _split_attachments(rechnung.anhaenge)
-
-    resource_id = f"{supplier_name} / {rechnung.rechnungsnummer}"
-    request = approvals.create(
-        _resolve_tenant_id(ctx),
-        action="odoo_eingangsrechnung_anlegen",
-        resource_id=resource_id,
-        data=data,
-        blobs=blobs,
-        ttl=ODOO_APPROVAL_TTL,
-    )
-    return _pending_response(request, f"Eingangsrechnung {resource_id} als Entwurf in Odoo ablegen?{note}")
-
-
-@mcp.tool()
 def odoo_anhang_ablegen(ctx: Context, ablage: AnhangAblageRequest) -> PendingApprovalDTO:
     """Request human approval to store file(s) on an existing Odoo record: an
     invoice, order, partner or product. Writes nothing yet. Once approved, call
-    odoo_anhang_ablegen_execute. Use odoo_eingangsrechnung_anlegen for a new
-    supplier invoice instead."""
+    odoo_anhang_ablegen_execute. Use odoo_rechnung_ablegen for a new supplier
+    invoice instead."""
     rows = _odoo().read(ablage.res_model, [ablage.res_id], ["display_name"])
     if not rows:
         raise OdooError(404, f"{ablage.res_model} {ablage.res_id} not found")
@@ -452,91 +557,6 @@ def odoo_verkaufspreis_aendern(ctx: Context, aenderung: VerkaufspreisRequest) ->
 
 
 # --- writes: execute (each consumes its approval first, so it can never run twice) ---
-
-
-@mcp.tool()
-def odoo_eingangsrechnung_anlegen_execute(ctx: Context, approval_id: str) -> dict:
-    """Store the supplier invoice of an approved odoo_eingangsrechnung_anlegen
-    request as a draft and attach its files. Fails unless a human has approved it;
-    each approval works once. If a bill with this number already exists for the
-    supplier, only missing attachments are added."""
-    try:
-        approval = approvals.consume_approved(approval_id, _resolve_tenant_id(ctx), "odoo_eingangsrechnung_anlegen")
-    except (approvals.ApprovalNotFoundError, approvals.ApprovalStateError) as exc:
-        return _approval_error(exc, approval_id)
-
-    bill_id = None
-    try:
-        reviewed = dict(approval.data)
-        meta = reviewed.pop("anhaenge")
-        reviewed.pop("lieferant_name", None)
-        rechnung = EingangsrechnungDaten.model_validate(reviewed)
-        client = _odoo()
-
-        partner_id = rechnung.lieferant_id
-        supplier_created = False
-        if partner_id is None:
-            partner_id = client.find_supplier(rechnung.lieferant.name, rechnung.lieferant.ust_id)
-            if partner_id is None:
-                partner_id = client.create_supplier(**rechnung.lieferant.model_dump())
-                supplier_created = True
-
-        bill_id = client.find_vendor_bill(partner_id, rechnung.rechnungsnummer)
-        bill_created = bill_id is None
-        if bill_created:
-            bill_id = client.create_draft_vendor_bill(
-                partner_id=partner_id,
-                rechnungsnummer=rechnung.rechnungsnummer,
-                rechnungsdatum=rechnung.rechnungsdatum.isoformat(),
-                faelligkeitsdatum=rechnung.faelligkeitsdatum.isoformat() if rechnung.faelligkeitsdatum else None,
-                waehrung=rechnung.waehrung,
-                lines=[_bill_line(client, position) for position in rechnung.positionen],
-            )
-
-        stored = _attach_all(client, approval, meta, "account.move", bill_id)
-        result = {
-            "rechnung_id": bill_id,
-            "lieferant_id": partner_id,
-            "lieferant_angelegt": supplier_created,
-            "rechnung_angelegt": bill_created,
-            "anhaenge": stored,
-        }
-        new_attachments = [item["attachment_id"] for item in stored if item["added"]]
-        if bill_created and new_attachments:
-            # Shows the PDF next to the bill form. Never worth failing the store for.
-            try:
-                client.set_main_attachment(bill_id, new_attachments[0])
-            except OdooError as exc:
-                result["hinweis"] = f"Hauptanhang nicht gesetzt: {exc}"
-        approvals.discard_blobs(approval)
-        return result
-    except OdooError as exc:
-        error = _error(exc)
-        if bill_id is not None:
-            error["rechnung_id"] = bill_id
-            error["hinweis"] = "Die Rechnung existiert, aber ein Anhang fehlt evtl.; erneutes Anfragen ergänzt ihn."
-        return error
-    except (ValidationError, ValueError) as exc:
-        return {"error": f"invalid data after approval: {exc}", "status_code": 422}
-
-
-def _bill_line(client: OdooClient, position) -> dict:
-    line: dict[str, Any] = {
-        "name": position.beschreibung,
-        "quantity": position.menge,
-        "price_unit": position.einzelpreis,
-    }
-    if position.steuer_prozent is not None:
-        tax = client.resolve_purchase_tax(position.steuer_prozent, position.steuer_name)
-        line["tax_ids"] = [[6, 0, [tax["id"]]]]
-    if position.artikel_referenz:
-        rows = client.search_read(
-            "product.product", [["default_code", "=", position.artikel_referenz]], ["id"], limit=1
-        )
-        if not rows:
-            raise OdooError(404, f"article {position.artikel_referenz!r} not found")
-        line["product_id"] = rows[0]["id"]
-    return line
 
 
 @mcp.tool()

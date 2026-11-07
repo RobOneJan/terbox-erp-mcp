@@ -24,12 +24,19 @@ Credentials and security models (`DENIED_MODELS`) and secret or binary fields
 when used only in a domain filter, grouping or sort order. Custom read methods
 on individual models are not exposed, only the generic ones (`READ_METHODS`).
 
-**Writing** is limited to these actions, each a prepare tool plus an `_execute`
-tool. There is no generic write.
+**Supplier invoices** go to `odoo_rechnung_ablegen` without approval: it finds
+the supplier from name or VAT id and stores a draft bill with the PDF and one
+total line per tax rate, never the individual items, and never posts it. Only
+known suppliers qualify. For an unknown one the agent asks for approval to
+create it (`odoo_lieferant_anlegen`), then stores the invoice. Repeating it for
+the same invoice creates nothing twice.
+
+**Other writes** need approval, each a prepare tool plus an `_execute` tool.
+There is no generic write.
 
 | Prepare tool | Effect after approval |
 | --- | --- |
-| `odoo_eingangsrechnung_anlegen` | Draft vendor bill with files, plus the supplier if new. Never posted. |
+| `odoo_lieferant_anlegen` | New supplier with the details from its invoice. |
 | `odoo_anhang_ablegen` | Files on an invoice, order, partner or product. |
 | `odoo_material_anlegen` | New article, optionally with supplier and price. |
 | `odoo_einkaufspreis_aendern` | Changes one stored supplier price. |

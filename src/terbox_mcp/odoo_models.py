@@ -91,6 +91,8 @@ def _distinct_filenames(anhaenge: list[Anhang]) -> None:
 
 
 class Lieferant(BaseModel):
+    """A new supplier, with the details printed on its invoice."""
+
     name: str = Field(min_length=1)
     ust_id: Optional[str] = None
     email: Optional[str] = None
@@ -100,34 +102,31 @@ class Lieferant(BaseModel):
     ort: Optional[str] = None
 
 
-class Rechnungsposition(BaseModel):
-    beschreibung: str = Field(min_length=1)
-    menge: float = Field(default=1.0, gt=0)
-    einzelpreis: float = Field(description="Net unit price.")
-    steuer_prozent: Optional[float] = Field(default=None, ge=0, le=100)
+class Betrag(BaseModel):
+    netto: float = Field(description="Net total of the invoice at this tax rate.")
+    steuer_prozent: float = Field(default=19.0, ge=0, le=100)
     steuer_name: Optional[str] = Field(
         default=None,
-        description=(
-            "Exact Odoo tax name, e.g. '19% I' (domestic) or '19% EU' (reverse charge). Filled in "
-            "automatically from steuer_prozent if omitted; set it explicitly for non-domestic suppliers."
-        ),
-    )
-    artikel_referenz: Optional[str] = Field(
-        default=None, description="Internal product reference (default_code), links the line to the product."
+        description="Exact Odoo tax name, e.g. '19% EU' for reverse charge. Defaults to the domestic tax.",
     )
 
 
-class EingangsrechnungDaten(BaseModel):
-    """Everything about a vendor bill except the file contents - this is what a
-    human reviews on the approval card."""
+class RechnungAblageRequest(BaseModel):
+    """A supplier invoice stored as one draft with its file - totals only, never
+    the individual items on it."""
 
-    lieferant_id: Optional[int] = Field(default=None, description="Existing Odoo partner id.")
-    lieferant: Optional[Lieferant] = Field(default=None, description="New supplier, if none exists yet.")
+    lieferant_id: Optional[int] = Field(default=None, description="Odoo partner id, if already known.")
+    lieferant_name: Optional[str] = Field(default=None, description="Supplier name as printed on the invoice.")
+    ust_id: Optional[str] = Field(default=None, description="Supplier VAT id as printed on the invoice.")
     rechnungsnummer: str = Field(min_length=1, description="The supplier's own invoice number.")
     rechnungsdatum: date
     faelligkeitsdatum: Optional[date] = None
     waehrung: str = Field(default="EUR", min_length=3, max_length=3)
-    positionen: list[Rechnungsposition] = Field(default_factory=list)
+    betraege: list[Betrag] = Field(
+        default_factory=list,
+        description="Net totals per tax rate (usually one entry). Leave empty if the totals are unclear.",
+    )
+    anhaenge: list[Anhang] = Field(min_length=1)
 
     @field_validator("waehrung")
     @classmethod
@@ -135,17 +134,9 @@ class EingangsrechnungDaten(BaseModel):
         return value.upper()
 
     @model_validator(mode="after")
-    def _exactly_one_supplier(self):
-        if (self.lieferant is None) == (self.lieferant_id is None):
-            raise ValueError("give exactly one of `lieferant` or `lieferant_id`")
-        return self
-
-
-class EingangsrechnungRequest(EingangsrechnungDaten):
-    anhaenge: list[Anhang] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def _distinct(self):
+    def _supplier_given(self):
+        if self.lieferant_id is None and not (self.lieferant_name or self.ust_id):
+            raise ValueError("give lieferant_id, or lieferant_name / ust_id from the invoice")
         _distinct_filenames(self.anhaenge)
         return self
 

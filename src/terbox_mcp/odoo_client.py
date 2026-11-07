@@ -303,13 +303,48 @@ class OdooClient:
             raise OdooError(404, f"no purchase tax of {percent}%{suffix} found")
         return rows[0]
 
-    def find_supplier(self, name: str, ust_id: str | None = None) -> int | None:
-        domains = ([[["vat", "=", ust_id]]] if ust_id else []) + [[["name", "=", name]]]
-        for domain in domains:
-            rows = self.search_read("res.partner", domain + [["parent_id", "=", False]], ["id"], limit=1)
+    def match_supplier(self, name: str | None, ust_id: str | None) -> tuple[int | None, list[dict]]:
+        """Find the supplier of an invoice: by VAT id, then exact name, then a
+        unique partial name among suppliers (either name containing the other).
+        Returns (id, []) on a clear match,
+        (None, candidates) when several fit, and (None, []) when none does."""
+        top = [["parent_id", "=", False]]
+        if ust_id:
+            vat = "".join(ust_id.split()).upper()
+            rows = self.search_read("res.partner", top + [["vat", "=", vat]], ["id"], limit=1)
             if rows:
-                return rows[0]["id"]
-        return None
+                return rows[0]["id"], []
+        if not name:
+            return None, []
+        rows = self.search_read("res.partner", top + [["name", "=ilike", name.strip()]], ["id"], limit=1)
+        if rows:
+            return rows[0]["id"], []
+        suppliers = top + [["supplier_rank", ">", 0]]
+        rows = self.search_read("res.partner", suppliers + [["name", "ilike", name.strip()]], ["id", "name"], limit=5)
+        if not rows:
+            # The other way round: the invoice prints more than Odoo stores, e.g.
+            # "E&S Zaun GbR, Inh. M. Schmidt" for "E&S Zaun GbR".
+            printed = name.lower()
+            everyone = self.search_read("res.partner", suppliers, ["id", "name"], limit=MAX_LIMIT)
+            rows = [row for row in everyone if row["name"] and row["name"].lower() in printed]
+        if len(rows) == 1:
+            return rows[0]["id"], []
+        return None, rows[:5]
+
+    def get_supplier(self, partner_id: int) -> dict | None:
+        """Only companies marked as suppliers - an invoice must never land on a
+        customer or a contact person because a model guessed the wrong id."""
+        rows = self.search_read(
+            "res.partner",
+            [["id", "=", partner_id], ["parent_id", "=", False], ["supplier_rank", ">", 0]],
+            ["name"],
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def bill_total(self, bill_id: int) -> float | None:
+        rows = self.read("account.move", [bill_id], ["amount_total"])
+        return rows[0].get("amount_total") if rows else None
 
     def find_vendor_bill(self, partner_id: int, rechnungsnummer: str) -> int | None:
         rows = self.search_read(

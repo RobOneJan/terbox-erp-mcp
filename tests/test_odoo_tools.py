@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import sys
 from types import SimpleNamespace
 
 import httpx
@@ -18,10 +19,11 @@ from terbox_mcp.models import PendingApprovalDTO
 from terbox_mcp.odoo_client import OdooAccessDenied, OdooClient, OdooError, OdooSettings
 from terbox_mcp.odoo_models import (
     AnhangAblageRequest,
-    EingangsrechnungRequest,
     EinkaufspreisRequest,
+    Lieferant,
     MaterialRequest,
     PreisPruefPosition,
+    RechnungAblageRequest,
     VerkaufspreisRequest,
 )
 
@@ -50,6 +52,8 @@ class FakeOdoo:
         if (model, method) == ("ir.attachment", "read"):
             return httpx.Response(200, json=[{"id": 900, "checksum": self.stored_checksum}])
         answer = self.responses.get((model, method))
+        if callable(answer):  # answers that depend on the request, e.g. the domain searched
+            answer = answer(body)
         if answer is None:
             answer = [1000 + len(self.calls)] if method == "create" else True if method in WRITE_METHODS else []
         if isinstance(answer, httpx.Response):
@@ -71,22 +75,43 @@ def odoo(monkeypatch: pytest.MonkeyPatch) -> FakeOdoo:
     return fake
 
 
-def _bill(**overrides) -> EingangsrechnungRequest:
+SUPPLIERS = [{"id": 26, "name": "Zaunbau Müller GmbH", "vat": "DE123456789", "supplier_rank": 1}]
+
+
+def _partners(body: dict) -> list[dict]:
+    """res.partner search_read against SUPPLIERS, honouring the leaves the code uses."""
+    rows = SUPPLIERS
+    for field, op, value in (leaf for leaf in body["domain"] if isinstance(leaf, list)):
+        if field == "parent_id":
+            continue
+        if op == "=":
+            rows = [r for r in rows if r.get(field) == value]
+        elif op == "=ilike":
+            rows = [r for r in rows if r[field].lower() == value.lower()]
+        elif op == "ilike":
+            rows = [r for r in rows if value.lower() in r[field].lower()]
+        elif op == ">":
+            rows = [r for r in rows if r.get(field, 0) > value]
+    return [{"id": r["id"], "name": r["name"]} for r in rows]
+
+
+def _rechnung(**overrides) -> RechnungAblageRequest:
     values = {
-        "lieferant_id": 26,
+        "lieferant_name": "Zaunbau Müller",
         "rechnungsnummer": "RE-1",
         "rechnungsdatum": "2026-10-20",
-        "positionen": [{"beschreibung": "Blech", "menge": 2, "einzelpreis": 10.5, "steuer_prozent": 19}],
+        "betraege": [{"netto": 3096.0, "steuer_prozent": 19}],
         "anhaenge": [{"dateiname": "re-1.pdf", "inhalt_base64": PDF_B64}],
     }
-    return EingangsrechnungRequest(**{**values, **overrides})
+    return RechnungAblageRequest(**{**values, **overrides})
 
 
-def _prepare_bill(odoo: FakeOdoo, **overrides) -> PendingApprovalDTO:
-    odoo.responses[("res.partner", "read")] = [{"id": 26, "name": "JTK"}]
+def _odoo_for_bills(odoo: FakeOdoo) -> FakeOdoo:
+    odoo.responses[("res.partner", "search_read")] = _partners
     odoo.responses[("account.tax", "search_read")] = [{"id": 25, "name": "19% I", "amount": 19.0}]
     odoo.responses[("res.currency", "search_read")] = [{"id": 126}]
-    return odoo_tools.odoo_eingangsrechnung_anlegen(_ctx(), _bill(**overrides))
+    odoo.responses[("account.move", "read")] = [{"id": 1, "amount_total": 3684.24}]
+    return odoo
 
 
 # --- read guards -------------------------------------------------------------
@@ -165,139 +190,168 @@ def test_overview_keeps_other_sections_when_one_fails(odoo: FakeOdoo) -> None:
     assert "fehler" not in overview["einkauf"]
 
 
-# --- vendor bill flow --------------------------------------------------------
+# --- supplier invoices -------------------------------------------------------
 
 
-def test_prepare_bill_writes_nothing_and_keeps_file_off_the_card(odoo: FakeOdoo) -> None:
-    pending = _prepare_bill(odoo)
+def test_invoice_of_known_supplier_is_stored_without_approval(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
 
-    assert isinstance(pending, PendingApprovalDTO)
-    assert pending.status == "pending"
-    assert odoo.writes() == []
-    assert pending.payload["positionen[0].steuer_name"] == "19% I"
-    assert pending.payload["anhaenge[0].dateiname"] == "re-1.pdf"
-    assert not any(PDF_B64 in value for value in pending.payload.values())
-    assert "inhalt_base64" not in " ".join(pending.payload)
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung())
 
-
-def test_execute_before_approval_writes_nothing(odoo: FakeOdoo) -> None:
-    pending = _prepare_bill(odoo)
-    result = odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), pending.id)
-    assert result["status_code"] == 409
-    assert odoo.writes() == []
-
-
-def test_full_bill_flow_creates_draft_with_verified_attachment(odoo: FakeOdoo) -> None:
-    pending = _prepare_bill(odoo)
-    approvals.decide(pending.id, TENANT, approve=True)
-
-    result = odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), pending.id)
-
-    assert result["rechnung_angelegt"] is True
+    assert result["status"] == "abgelegt"
+    assert result["meldung"] == "Rechnung RE-1 von Zaunbau Müller GmbH (3.684,24 €) als Entwurf in Odoo abgelegt."
     vals = odoo.body_of("account.move", "create")["vals_list"][0]
     assert vals["move_type"] == "in_invoice"
+    assert vals["partner_id"] == 26
     assert vals["ref"] == "RE-1"
-    assert vals["invoice_line_ids"][0][2]["tax_ids"] == [[6, 0, [25]]]
+    # One total line per tax rate, never the individual items.
+    [line] = vals["invoice_line_ids"]
+    assert line[2]["price_unit"] == 3096.0
+    assert line[2]["tax_ids"] == [[6, 0, [25]]]
     attachment = odoo.body_of("ir.attachment", "create")["vals_list"][0]
     assert base64.b64decode(attachment["raw"]) == PDF
     assert "datas" not in attachment  # the field no longer exists on saas~19.4
-    assert attachment["mimetype"] == "application/pdf"
-    # Never posted: no action_post or anything else beyond these writes.
+    # Never posted, nothing pending.
     assert {call[1] for call in odoo.calls} <= {"read", "search_read", "create", "write"}
-
-    again = odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), pending.id)
-    assert again["status_code"] == 409
+    assert approvals._store == {}
 
 
-def test_every_card_field_can_come_back_as_an_edit(odoo: FakeOdoo) -> None:
-    """agent-hub's Adaptive Card returns ALL payload fields on approve, not just
-    changed ones. A payload key that isn't a valid edit path would make every
-    approval fail with a 400."""
-    pending = _prepare_bill(odoo)
-    approvals.decide(pending.id, TENANT, approve=True, edits=dict(pending.payload))
-    result = odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), pending.id)
-    assert result["rechnung_angelegt"] is True
+def test_supplier_is_found_by_vat_id_whatever_its_name(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(lieferant_name="ZM Zaunsysteme", ust_id="DE 123 456 789"))
+    assert result["lieferant_id"] == 26
 
 
-def test_human_can_correct_tax_and_filename_on_the_card(odoo: FakeOdoo) -> None:
-    pending = _prepare_bill(odoo)
-    approvals.decide(
-        pending.id,
-        TENANT,
-        approve=True,
-        edits={"positionen[0].steuer_name": "19% EU", "anhaenge[0].dateiname": "../korrigiert.pdf"},
-    )
-    odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), pending.id)
-
-    tax_lookup = [body for m, name, body in odoo.calls if (m, name) == ("account.tax", "search_read")][-1]
-    assert ["name", "=", "19% EU"] in tax_lookup["domain"]
-    assert odoo.body_of("ir.attachment", "create")["vals_list"][0]["name"] == "korrigiert.pdf"
+def test_supplier_is_found_when_the_invoice_prints_more_than_odoo_stores(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(lieferant_name="Zaunbau Müller GmbH, Inh. Hans Müller"))
+    assert result["lieferant_id"] == 26
 
 
-def test_invalid_edit_fails_without_writing(odoo: FakeOdoo) -> None:
-    pending = _prepare_bill(odoo)
-    approvals.decide(pending.id, TENANT, approve=True, edits={"rechnungsdatum": "kein datum"})
-    result = odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), pending.id)
-    assert result["status_code"] == 422
+def test_unknown_supplier_stores_nothing(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(lieferant_name="Neu GmbH"))
+
+    assert result["status"] == "lieferant_unbekannt"
     assert odoo.writes() == []
 
 
-def test_existing_bill_is_not_created_twice(odoo: FakeOdoo) -> None:
+def test_ambiguous_supplier_lists_candidates_and_stores_nothing(odoo: FakeOdoo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "SUPPLIERS",
+        SUPPLIERS + [{"id": 27, "name": "Zaunbau Müller Nord KG", "supplier_rank": 1}],
+    )
+    _odoo_for_bills(odoo)
+
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung())
+
+    assert result["status"] == "lieferant_unklar"
+    assert {c["lieferant_id"] for c in result["kandidaten"]} == {26, 27}
+    assert odoo.writes() == []
+
+
+def test_invoice_never_lands_on_a_partner_that_is_not_a_supplier(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(lieferant_name=None, lieferant_id=99))
+    assert result["status_code"] == 404
+    assert odoo.writes() == []
+
+
+def test_same_invoice_twice_is_not_created_again(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
     odoo.responses[("account.move", "search_read")] = [{"id": 77}]
-    pending = _prepare_bill(odoo)
-    assert "existiert bereits" in pending.message
-    approvals.decide(pending.id, TENANT, approve=True)
+    odoo.responses[("ir.attachment", "search_read")] = [{"id": 3}]
 
-    result = odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), pending.id)
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung())
 
+    assert result["status"] == "bereits_vorhanden"
     assert result["rechnung_id"] == 77
-    assert result["rechnung_angelegt"] is False
-    assert ("account.move", "create") not in odoo.writes()
+    assert odoo.writes() == []
+
+
+def test_invoice_without_clear_totals_still_stores_the_file(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    odoo.responses[("account.move", "read")] = [{"id": 1, "amount_total": 0.0}]
+
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(betraege=[]))
+
+    assert "invoice_line_ids" not in odoo.body_of("account.move", "create")["vals_list"][0]
     assert ("ir.attachment", "create") in odoo.writes()
+    assert "€" not in result["meldung"]
+
+
+def test_reverse_charge_tax_is_used_when_named(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    odoo_tools.odoo_rechnung_ablegen(_rechnung(betraege=[{"netto": 100, "steuer_prozent": 19, "steuer_name": "19% EU"}]))
+    tax_lookup = odoo.body_of("account.tax", "search_read")
+    assert ["name", "=", "19% EU"] in tax_lookup["domain"]
 
 
 def test_corrupted_upload_is_removed_and_reported(odoo: FakeOdoo) -> None:
-    pending = _prepare_bill(odoo)
-    approvals.decide(pending.id, TENANT, approve=True)
+    _odoo_for_bills(odoo)
     odoo.stored_checksum = "not-the-real-sha1"
 
-    result = odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), pending.id)
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung())
 
     assert "corrupted" in result["error"]
-    assert result["rechnung_id"]  # the error names the bill that does exist
     assert ("ir.attachment", "unlink") in odoo.writes()
-
-
-def test_new_supplier_is_only_created_after_approval(odoo: FakeOdoo) -> None:
-    pending = _prepare_bill(odoo, lieferant_id=None, lieferant={"name": "Neu GmbH"})
-    assert "neu angelegt" in pending.message
-    assert odoo.writes() == []
-    approvals.decide(pending.id, TENANT, approve=True)
-
-    result = odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), pending.id)
-
-    assert result["lieferant_angelegt"] is True
-    vals = odoo.body_of("res.partner", "create")["vals_list"][0]
-    assert vals["name"] == "Neu GmbH"
-    assert vals["supplier_rank"] == 1
 
 
 @pytest.mark.parametrize("content", [b"MZ\x90 not a document", b"<html>hi</html>"])
 def test_only_document_files_are_accepted(content: bytes) -> None:
     with pytest.raises(ValueError):
-        _bill(anhaenge=[{"dateiname": "x.pdf", "inhalt_base64": base64.b64encode(content).decode()}])
+        _rechnung(anhaenge=[{"dateiname": "x.pdf", "inhalt_base64": base64.b64encode(content).decode()}])
 
 
-def test_rejected_or_wrong_action_approval_cannot_execute(odoo: FakeOdoo) -> None:
-    pending = _prepare_bill(odoo)
+def test_new_supplier_needs_approval_then_invoice_can_be_stored(odoo: FakeOdoo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "SUPPLIERS", [])
+    _odoo_for_bills(odoo)
+
+    pending = odoo_tools.odoo_lieferant_anlegen(_ctx(), Lieferant(name="Neu GmbH", ust_id="DE999999999", ort="Essen"))
+    assert pending.status == "pending"
+    assert set(pending.payload) == {"name", "ust_id", "ort"}  # a small card
+    assert odoo.writes() == []
+    assert odoo_tools.odoo_lieferant_anlegen_execute(_ctx(), pending.id)["status_code"] == 409
+
+    approvals.decide(pending.id, TENANT, approve=True, edits=dict(pending.payload))
+    result = odoo_tools.odoo_lieferant_anlegen_execute(_ctx(), pending.id)
+
+    assert result["angelegt"] is True
+    vals = odoo.body_of("res.partner", "create")["vals_list"][0]
+    assert vals["name"] == "Neu GmbH"
+    assert vals["supplier_rank"] == 1
+    assert odoo_tools.odoo_lieferant_anlegen_execute(_ctx(), pending.id)["status_code"] == 409
+
+
+def test_existing_supplier_is_not_proposed_again(odoo: FakeOdoo, monkeypatch: pytest.MonkeyPatch) -> None:
+    _odoo_for_bills(odoo)
+    with pytest.raises(OdooError, match="already exists"):
+        odoo_tools.odoo_lieferant_anlegen(_ctx(), Lieferant(name="Zaunbau Müller GmbH"))
+    # A unique partial match counts as the same supplier, not a new one.
+    with pytest.raises(OdooError, match="already exists"):
+        odoo_tools.odoo_lieferant_anlegen(_ctx(), Lieferant(name="Müller"))
+    monkeypatch.setattr(
+        sys.modules[__name__], "SUPPLIERS", SUPPLIERS + [{"id": 27, "name": "Müller Nord KG", "supplier_rank": 1}]
+    )
+    with pytest.raises(OdooError, match="similar suppliers"):
+        odoo_tools.odoo_lieferant_anlegen(_ctx(), Lieferant(name="Müller"))
+    assert odoo.writes() == []
+
+
+def test_rejected_or_wrong_action_approval_cannot_execute(odoo: FakeOdoo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "SUPPLIERS", [])
+    _odoo_for_bills(odoo)
+    pending = odoo_tools.odoo_lieferant_anlegen(_ctx(), Lieferant(name="Neu GmbH"))
     approvals.decide(pending.id, TENANT, approve=True)
-    # An approval for a bill must not unlock a price change.
+    # An approval for a supplier must not unlock a price change.
     assert odoo_tools.odoo_einkaufspreis_aendern_execute(_ctx(), pending.id)["status_code"] == 409
 
-    other = _prepare_bill(odoo)
+    other = odoo_tools.odoo_lieferant_anlegen(_ctx(), Lieferant(name="Andere GmbH"))
     approvals.decide(other.id, TENANT, approve=False)
-    assert odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), other.id)["status_code"] == 409
-    assert approvals.get(other.id, TENANT).blobs == []
+    assert odoo_tools.odoo_lieferant_anlegen_execute(_ctx(), other.id)["status_code"] == 409
+    assert odoo.writes() == []
 
 
 # --- attachments, materials, prices -----------------------------------------
@@ -450,20 +504,26 @@ def test_pending_approval_with_file_survives_restart(
     odoo: FakeOdoo, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     monkeypatch.setenv("APPROVAL_STORE_DIR", str(tmp_path))
-    pending = _prepare_bill(odoo)
+    odoo.responses[("purchase.order", "read")] = [{"id": 5, "display_name": "P00005"}]
+    pending = odoo_tools.odoo_anhang_ablegen(
+        _ctx(),
+        AnhangAblageRequest(
+            res_model="purchase.order", res_id=5, anhaenge=[{"dateiname": "ab.pdf", "inhalt_base64": PDF_B64}]
+        ),
+    )
 
     approvals._store.clear()  # what scaling to zero does to the in-memory store
 
     approvals.decide(pending.id, TENANT, approve=True)
     approvals._store.clear()
-    result = odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), pending.id)
-    assert result["rechnung_angelegt"] is True
+    result = odoo_tools.odoo_anhang_ablegen_execute(_ctx(), pending.id)
+    assert result["anhaenge"][0]["added"] is True
     assert base64.b64decode(odoo.body_of("ir.attachment", "create")["vals_list"][0]["raw"]) == PDF
 
     # The file does not linger after use, and a replay still fails after a restart.
     assert list(tmp_path.glob("*.bin")) == []
     approvals._store.clear()
-    assert odoo_tools.odoo_eingangsrechnung_anlegen_execute(_ctx(), pending.id)["status_code"] == 409
+    assert odoo_tools.odoo_anhang_ablegen_execute(_ctx(), pending.id)["status_code"] == 409
 
 
 def test_store_rejects_path_traversal_ids(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -491,21 +551,32 @@ async def test_pending_approval_is_detectable_by_agent_hub(odoo: FakeOdoo) -> No
     assert isinstance(data["message"], str)
 
 
-async def test_bill_approval_is_detectable_by_agent_hub(odoo: FakeOdoo) -> None:
-    odoo.responses[("res.partner", "read")] = [{"id": 26, "name": "JTK"}]
+async def test_invoice_result_reaches_agent_hub_as_plain_text_not_an_approval(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
     result = await server.mcp.call_tool(
-        "odoo_eingangsrechnung_anlegen",
+        "odoo_rechnung_ablegen",
         {
             "rechnung": {
-                "lieferant_id": 26,
+                "lieferant_name": "Zaunbau Müller",
                 "rechnungsnummer": "RE-1",
                 "rechnungsdatum": "2026-10-20",
                 "anhaenge": [{"dateiname": "a.pdf", "inhalt_base64": PDF_B64}],
             }
         },
     )
-    assert result.structured_content["status"] == "pending"
-    assert PDF_B64 not in json.dumps(result.structured_content)
+    text = "\n".join(block.text for block in result.content if block.type == "text")
+    assert "als Entwurf in Odoo abgelegt" in text
+    assert PDF_B64 not in text
+    assert (result.structured_content or {}).get("status") != "pending"
+
+
+async def test_supplier_approval_is_detectable_by_agent_hub(odoo: FakeOdoo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "SUPPLIERS", [])
+    _odoo_for_bills(odoo)
+    result = await server.mcp.call_tool("odoo_lieferant_anlegen", {"lieferant": {"name": "Neu GmbH"}})
+    data = result.structured_content
+    assert data["status"] == "pending"
+    assert isinstance(data["id"], str) and isinstance(data["message"], str)
 
 
 async def test_attachment_is_detectable_by_agent_hub(odoo: FakeOdoo) -> None:
