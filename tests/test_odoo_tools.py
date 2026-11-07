@@ -420,6 +420,15 @@ def test_same_detail_written_differently_is_not_a_change(odoo: FakeOdoo) -> None
     assert "ergänzt" not in result["meldung"]
 
 
+@pytest.mark.parametrize("printed", ["Hansestr. 36", "Hansestrasse 36", "hansestraße  36", "Hanse-Str. 36"])
+def test_street_spellings_are_one_address(odoo: FakeOdoo, printed: str) -> None:
+    _odoo_for_bills(odoo)
+    _supplier_in_odoo(odoo, street="Hansestraße 36", zip="51688", city="Wipperfürth")
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(kontakt={"strasse": printed, "plz": "51688"}))
+    assert "abweichende_kontaktdaten" not in result
+    assert _supplier_write(odoo) is None
+
+
 def test_differing_iban_only_warns_and_is_never_stored(odoo: FakeOdoo) -> None:
     _odoo_for_bills(odoo)
     _supplier_in_odoo(odoo)

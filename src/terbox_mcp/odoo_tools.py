@@ -292,7 +292,12 @@ def _normalized(field: str, value: str | None) -> str:
         return re.sub(r"^(\+|00)49", "0", digits)
     if field == "ust_id":
         return re.sub(r"\s", "", value).upper()
-    return " ".join(value.split()).casefold()
+    value = value.casefold()
+    if field == "strasse":
+        # "Hansestr. 36", "Hansestraße 36" and "Hansestrasse 36" are one address.
+        value = re.sub(r"(straße|strasse|str\.?)", "str", value)
+        return re.sub(r"[\s.,-]", "", value)
+    return " ".join(value.split())
 
 
 def _normalized_iban(value: str) -> str:
