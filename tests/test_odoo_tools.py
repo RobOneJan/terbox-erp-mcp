@@ -735,6 +735,48 @@ def test_batch_needs_one_to_thirty_changes(odoo: FakeOdoo) -> None:
         odoo_tools.odoo_einkaufspreise_aendern(_ctx(), [])
 
 
+def _main_supplier(odoo: FakeOdoo, main_id: int) -> None:
+    odoo.responses[("product.supplierinfo", "search_read")] = [{"id": main_id}]
+
+
+def _template_writes(odoo: FakeOdoo) -> list[dict]:
+    return [body for m, name, body in odoo.calls if (m, name) == ("product.template", "write")]
+
+
+def test_price_of_the_main_supplier_becomes_the_articles_cost(odoo: FakeOdoo) -> None:
+    pending = _prepare_price(odoo)
+    _main_supplier(odoo, 3)
+    approvals.decide(pending.id, TENANT, approve=True)
+
+    result = odoo_tools.odoo_einkaufspreis_aendern_execute(_ctx(), pending.id)
+
+    assert result["kosten_aktualisiert"] is True
+    assert _template_writes(odoo) == [{"ids": [22], "vals": {"standard_price": 12.5}}]
+
+
+def test_price_of_a_second_supplier_leaves_the_cost_alone(odoo: FakeOdoo) -> None:
+    pending = _prepare_price(odoo)
+    _main_supplier(odoo, 99)
+    approvals.decide(pending.id, TENANT, approve=True)
+
+    result = odoo_tools.odoo_einkaufspreis_aendern_execute(_ctx(), pending.id)
+
+    assert result["kosten_aktualisiert"] is False
+    assert _template_writes(odoo) == []
+
+
+def test_batch_updates_cost_for_main_suppliers(odoo: FakeOdoo) -> None:
+    _supplier_prices(odoo, {3: 10.0})
+    _main_supplier(odoo, 3)
+    pending = odoo_tools.odoo_einkaufspreise_aendern(_ctx(), [EinkaufspreisRequest(lieferantenpreis_id=3, neuer_preis=11)])
+    approvals.decide(pending.id, TENANT, approve=True)
+
+    result = odoo_tools.odoo_einkaufspreise_aendern_execute(_ctx(), pending.id)
+
+    assert result["geaendert"][0]["kosten_aktualisiert"] is True
+    assert _template_writes(odoo) == [{"ids": [3], "vals": {"standard_price": 11.0}}]
+
+
 # --- persistence across a restart --------------------------------------------
 
 

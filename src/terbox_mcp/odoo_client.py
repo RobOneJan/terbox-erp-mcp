@@ -557,13 +557,40 @@ class OdooClient:
     def create_supplier_price(
         self, *, tmpl_id: int, partner_id: int, price: float, product_code: str | None
     ) -> int:
-        return self._create(
+        supplierinfo_id = self._create(
             "product.supplierinfo",
             _clean({"product_tmpl_id": tmpl_id, "partner_id": partner_id, "price": price, "product_code": product_code}),
         )
+        if price:
+            self._sync_cost(supplierinfo_id, price)
+        return supplierinfo_id
 
-    def set_supplier_price(self, supplierinfo_id: int, price: float) -> None:
+    def set_supplier_price(self, supplierinfo_id: int, price: float) -> bool:
+        """Returns whether the article's cost followed (see _sync_cost)."""
         self._call("product.supplierinfo", "write", ids=[supplierinfo_id], vals={"price": price})
+        return self._sync_cost(supplierinfo_id, price)
+
+    def _sync_cost(self, supplierinfo_id: int, price: float) -> bool:
+        """Set the article's cost (standard_price) to this supplier price when it
+        is the article's main supplier - the first by Odoo's own sequence, the
+        one purchase orders use too. Sales prices follow from the cost via the
+        pricelist's markups, so a new purchase price reaches them without anyone
+        touching a sales price. A failure here never undoes the price change."""
+        try:
+            rows = self.read("product.supplierinfo", [supplierinfo_id], ["product_tmpl_id"])
+            tmpl = rows[0].get("product_tmpl_id") if rows else None
+            if not tmpl:
+                return False
+            tmpl_id = tmpl[0] if isinstance(tmpl, list) else tmpl
+            main = self.search_read(
+                "product.supplierinfo", [["product_tmpl_id", "=", tmpl_id]], ["id"], limit=1, order="sequence, id"
+            )
+            if not main or main[0]["id"] != supplierinfo_id:
+                return False
+            self._call("product.template", "write", ids=[tmpl_id], vals={"standard_price": price})
+            return True
+        except OdooError:
+            return False
 
     def set_sales_price(self, tmpl_id: int, price: float) -> None:
         self._call("product.template", "write", ids=[tmpl_id], vals={"list_price": price})

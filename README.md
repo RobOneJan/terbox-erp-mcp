@@ -61,6 +61,11 @@ There is no generic write.
 | `odoo_material_anlegen` | New article, optionally with supplier and price. |
 | `odoo_einkaufspreis_aendern` | Changes one stored supplier price. |
 | `odoo_einkaufspreise_aendern` | Changes several supplier prices on one card. |
+
+A changed or new supplier price also becomes the article's cost when that
+supplier is the article's main one (first by Odoo's sequence). Sales prices are
+not written at all: the pricelist "Verkauf (Kosten + Aufschlag)" derives them
+from the cost with a markup per product category.
 | `odoo_verkaufspreis_aendern` | Changes an article's list price. Existing quotes keep theirs. |
 
 A prepare tool returns a pending approval, which agent-hub turns into a Teams

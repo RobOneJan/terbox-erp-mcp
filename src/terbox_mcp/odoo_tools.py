@@ -867,13 +867,14 @@ def odoo_einkaufspreis_aendern_execute(ctx: Context, approval_id: str) -> dict:
         expected = float(approval.data["alter_preis"])
         if abs((row.get("price") or 0.0) - expected) > 1e-6:
             raise OdooError(409, f"price is now {row.get('price')}, approval was for a change from {expected}")
-        client.set_supplier_price(aenderung.lieferantenpreis_id, aenderung.neuer_preis)
+        kosten = client.set_supplier_price(aenderung.lieferantenpreis_id, aenderung.neuer_preis)
     except OdooError as exc:
         return _error(exc)
     return {
         "lieferantenpreis_id": aenderung.lieferantenpreis_id,
         "alter_preis": expected,
         "neuer_preis": aenderung.neuer_preis,
+        "kosten_aktualisiert": kosten,
     }
 
 
@@ -1037,8 +1038,10 @@ def odoo_einkaufspreise_aendern_execute(ctx: Context, approval_id: str) -> dict:
             if abs((row.get("price") or 0.0) - float(preis["alter_preis"])) > 1e-6:
                 uebersprungen.append({"artikel": artikel, "grund": f"Preis inzwischen {row.get('price')}"})
                 continue
-            client.set_supplier_price(int(preis["lieferantenpreis_id"]), neu)
-            geaendert.append({"artikel": artikel, "alter_preis": float(preis["alter_preis"]), "neuer_preis": neu})
+            kosten = client.set_supplier_price(int(preis["lieferantenpreis_id"]), neu)
+            geaendert.append(
+                {"artikel": artikel, "alter_preis": float(preis["alter_preis"]), "neuer_preis": neu, "kosten_aktualisiert": kosten}
+            )
     except OdooError as exc:
         error = _error(exc)
         error["bereits_geaendert"] = geaendert
