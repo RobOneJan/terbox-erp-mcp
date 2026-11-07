@@ -13,6 +13,7 @@ model's docstring). `odoo_anhang_lesen` is bare for the same reason.
 
 from __future__ import annotations
 
+import re
 from datetime import date, timedelta
 from typing import Any
 
@@ -21,13 +22,14 @@ from pydantic import ValidationError
 
 from terbox_mcp import approvals
 from terbox_mcp.models import ApprovalStatusDTO, PendingApprovalDTO
-from terbox_mcp.odoo_client import DEFAULT_LIMIT, OdooClient, OdooError
+from terbox_mcp.odoo_client import DEFAULT_LIMIT, SUPPLIER_CONTACT_FIELDS, OdooClient, OdooError
 from terbox_mcp.odoo_models import (
     Anhang,
     AnhangAblageDaten,
     AnhangAblageRequest,
     AttachmentDTO,
     Lieferant,
+    LieferantAenderung,
     EinkaufspreisRequest,
     MaterialRequest,
     PreisPruefPosition,
@@ -274,6 +276,59 @@ def odoo_freigabe_status(ctx: Context, approval_id: str) -> ApprovalStatusDTO | 
     return ab1000_approval_status(ctx, approval_id)
 
 
+# --- supplier contact details ------------------------------------------------
+
+_LABELS = {"email": "E-Mail", "telefon": "Telefon", "ust_id": "USt-IdNr", "strasse": "Straße", "plz": "PLZ", "ort": "Ort"}
+_ADDRESS = ("strasse", "plz", "ort")
+
+
+def _normalized(field: str, value: str | None) -> str:
+    """Two spellings of the same detail must not count as a change."""
+    value = (value or "").strip()
+    if field == "email":
+        return value.lower()
+    if field == "telefon":
+        digits = re.sub(r"[^\d+]", "", value)
+        return re.sub(r"^(\+|00)49", "0", digits)
+    if field == "ust_id":
+        return re.sub(r"\s", "", value).upper()
+    return " ".join(value.split()).casefold()
+
+
+def _normalized_iban(value: str) -> str:
+    return re.sub(r"\s", "", value).upper()
+
+
+def _contact_changes(current: dict[str, str], printed: dict[str, str]) -> tuple[dict[str, str], dict[str, dict]]:
+    """Split the printed details into ones to fill in (the field is empty in Odoo)
+    and ones that differ from what Odoo has. The address is one unit: it is only
+    filled in when Odoo has none at all, so street and city never come from two
+    different places."""
+    fill: dict[str, str] = {}
+    differ: dict[str, dict] = {}
+    address_empty = not any(current.get(field) for field in _ADDRESS)
+    for field, value in printed.items():
+        if not value or not value.strip():
+            continue
+        old = current.get(field) or ""
+        if _normalized(field, old) == _normalized(field, value):
+            continue
+        if field in _ADDRESS:
+            if address_empty:
+                fill[field] = value.strip()
+            else:
+                differ[field] = {"bisher": old, "neu": value.strip()}
+        elif not old:
+            fill[field] = value.strip()
+        else:
+            differ[field] = {"bisher": old, "neu": value.strip()}
+    return fill, differ
+
+
+def _labels(fields) -> str:
+    return ", ".join(_LABELS[field] for field in fields)
+
+
 # --- supplier invoices: stored right away, a new supplier needs approval ------
 
 
@@ -286,8 +341,11 @@ def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
     """Store a supplier invoice in Odoo right away: a DRAFT bill with the file
     attached and one total line per tax rate, never the individual items.
 
-    Finds the supplier itself from lieferant_name / ust_id. Only for known
-    suppliers; status "lieferant_unbekannt" means call odoo_lieferant_anlegen
+    Finds the supplier itself from lieferant_name / ust_id. Pass the supplier's
+    contact details in kontakt and the IBAN in iban when the invoice or email
+    shows them: missing ones are added to the supplier, differing ones come back
+    as abweichende_kontaktdaten for odoo_lieferant_aktualisieren, and a differing
+    IBAN only raises a warning. Only for known suppliers; status "lieferant_unbekannt" means call odoo_lieferant_anlegen
     with the supplier details from the invoice, then call this tool again once
     that is approved. "lieferant_unklar" lists candidates: call again with the
     right lieferant_id. Repeating it for the same invoice creates nothing twice.
@@ -352,11 +410,35 @@ def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
     except OdooError as exc:
         return _error(exc)
 
+    # Only after the bill is safe: a problem with the supplier's details must
+    # never cost the invoice.
+    printed = {**(rechnung.kontakt.model_dump() if rechnung.kontakt else {}), "ust_id": rechnung.ust_id}
+    filled: dict[str, str] = {}
+    differ: dict[str, dict] = {}
+    iban_warning = False
+    try:
+        filled, differ = _contact_changes(client.supplier_contact(partner_id), printed)
+        if filled:
+            client.update_supplier_contact(partner_id, filled)
+        if rechnung.iban:
+            known = client.supplier_ibans(partner_id)
+            iban_warning = bool(known) and _normalized_iban(rechnung.iban) not in known
+    except OdooError as exc:
+        filled = {}
+        hinweis = f"Kontaktdaten nicht ergänzt: {exc}"
+
     amount = f" ({_euro(total)})" if total else ""
     if created:
         meldung = f"Rechnung {rechnung.rechnungsnummer} von {supplier['name']}{amount} als Entwurf in Odoo abgelegt."
     else:
         meldung = f"Rechnung {rechnung.rechnungsnummer} von {supplier['name']} war schon in Odoo."
+    if filled:
+        meldung += f" Beim Lieferanten ergänzt: {_labels(filled)}."
+    if iban_warning:
+        meldung += (
+            " Achtung: Die Rechnung nennt eine andere IBAN als in Odoo hinterlegt. Bitte telefonisch "
+            "beim Lieferanten prüfen, bevor bezahlt wird."
+        )
     result = {
         "status": "abgelegt" if created else "bereits_vorhanden",
         "meldung": meldung,
@@ -364,6 +446,12 @@ def odoo_rechnung_ablegen(rechnung: RechnungAblageRequest) -> dict:
         "lieferant_id": partner_id,
         "anhaenge": stored,
     }
+    if differ:
+        result["abweichende_kontaktdaten"] = differ
+        result["naechster_schritt"] = (
+            "call odoo_lieferant_aktualisieren with this lieferant_id and the new values, "
+            "so a human can approve the change"
+        )
     if hinweis:
         result["hinweis"] = hinweis
     return result
@@ -675,3 +763,67 @@ def odoo_verkaufspreis_aendern_execute(ctx: Context, approval_id: str) -> dict:
     except OdooError as exc:
         return _error(exc)
     return {"artikel_id": article["id"], "alter_preis": expected, "neuer_preis": aenderung.neuer_preis}
+
+
+@mcp.tool()
+def odoo_lieferant_aktualisieren(ctx: Context, aenderung: LieferantAenderung) -> PendingApprovalDTO:
+    """Request human approval to change a supplier's contact details (e-mail,
+    phone, VAT id, address) where they differ from Odoo. Writes nothing yet.
+    Bank details cannot be changed here. Once approved, call
+    odoo_lieferant_aktualisieren_execute."""
+    client = _odoo()
+    supplier = client.get_supplier(aenderung.lieferant_id)
+    if supplier is None:
+        raise OdooError(404, f"partner {aenderung.lieferant_id} is not a supplier")
+    current = client.supplier_contact(aenderung.lieferant_id)
+    printed = aenderung.model_dump(exclude={"lieferant_id"})
+    changes = {
+        field: {"bisher": current.get(field) or "", "neu": value.strip()}
+        for field, value in printed.items()
+        if value and value.strip() and _normalized(field, current.get(field)) != _normalized(field, value)
+    }
+    if not changes:
+        raise OdooError(409, "these details already match the supplier in Odoo")
+    data = {"lieferant_id": aenderung.lieferant_id, "lieferant": supplier["name"], "aenderungen": changes}
+    request = approvals.create(
+        _resolve_tenant_id(ctx),
+        action="odoo_lieferant_aktualisieren",
+        resource_id=supplier["name"],
+        data=data,
+        ttl=ODOO_APPROVAL_TTL,
+    )
+    summary = "; ".join(
+        f"{_LABELS[field]}: {change['bisher'] or '–'} → {change['neu']}" for field, change in changes.items()
+    )
+    return _pending_response(request, f"Kontaktdaten von {supplier['name']} ändern? {summary}")
+
+
+@mcp.tool()
+def odoo_lieferant_aktualisieren_execute(ctx: Context, approval_id: str) -> dict:
+    """Apply an approved odoo_lieferant_aktualisieren request. Fails unless a
+    human has approved it; each approval works once. Refuses if a detail changed
+    in Odoo after the request was made. A value cleared on the card is skipped,
+    never erased in Odoo."""
+    try:
+        approval = approvals.consume_approved(approval_id, _resolve_tenant_id(ctx), "odoo_lieferant_aktualisieren")
+    except (approvals.ApprovalNotFoundError, approvals.ApprovalStateError) as exc:
+        return _approval_error(exc, approval_id)
+    partner_id = approval.data["lieferant_id"]
+    changes = approval.data["aenderungen"]
+    if set(changes) - set(SUPPLIER_CONTACT_FIELDS):
+        return {"error": "invalid data after approval: unknown fields", "status_code": 422}
+    client = _odoo()
+    try:
+        current = client.supplier_contact(partner_id)
+        moved = [
+            field for field, change in changes.items()
+            if _normalized(field, current.get(field)) != _normalized(field, change.get("bisher"))
+        ]
+        if moved:
+            raise OdooError(409, f"{_labels(moved)} changed in Odoo since the request; ask again")
+        values = {field: change["neu"].strip() for field, change in changes.items() if (change.get("neu") or "").strip()}
+        if values:
+            client.update_supplier_contact(partner_id, values)
+    except OdooError as exc:
+        return _error(exc)
+    return {"lieferant_id": partner_id, "geaendert": sorted(values)}

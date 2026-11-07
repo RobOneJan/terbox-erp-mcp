@@ -71,6 +71,17 @@ DENIED_FIELDS = frozenset(
     }
 )
 
+# The supplier fields the agent may fill in or (with approval) change: tool
+# field name -> Odoo field. Deliberately no bank details.
+SUPPLIER_CONTACT_FIELDS = {
+    "email": "email",
+    "telefon": "phone",
+    "ust_id": "vat",
+    "strasse": "street",
+    "plz": "zip",
+    "ort": "city",
+}
+
 MAX_LIMIT = 200
 DEFAULT_LIMIT = 50
 # Binary fields (images, reports) come back as huge base64 strings. Nothing an
@@ -341,6 +352,26 @@ class OdooClient:
             limit=1,
         )
         return rows[0] if rows else None
+
+    def supplier_contact(self, partner_id: int) -> dict[str, str]:
+        rows = self.read("res.partner", [partner_id], list(SUPPLIER_CONTACT_FIELDS.values()))
+        row = rows[0] if rows else {}
+        return {name: row.get(field) or "" for name, field in SUPPLIER_CONTACT_FIELDS.items()}
+
+    def supplier_ibans(self, partner_id: int) -> set[str]:
+        rows = self.search_read(
+            "res.partner.bank", [["partner_id", "child_of", partner_id]], ["sanitized_account_number"], limit=MAX_LIMIT
+        )
+        return {row["sanitized_account_number"] for row in rows if row.get("sanitized_account_number")}
+
+    def update_supplier_contact(self, partner_id: int, values: dict[str, str]) -> None:
+        """`values` uses the tool's field names; anything outside
+        SUPPLIER_CONTACT_FIELDS is refused rather than passed on."""
+        unknown = set(values) - set(SUPPLIER_CONTACT_FIELDS)
+        if unknown:
+            raise OdooAccessDenied(f"supplier fields {sorted(unknown)} cannot be changed through this server")
+        vals = {SUPPLIER_CONTACT_FIELDS[name]: value for name, value in values.items()}
+        self._call("res.partner", "write", ids=[partner_id], vals=vals)
 
     def bill_total(self, bill_id: int) -> float | None:
         rows = self.read("account.move", [bill_id], ["amount_total"])

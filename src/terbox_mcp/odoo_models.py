@@ -102,6 +102,21 @@ class Lieferant(BaseModel):
     ort: Optional[str] = None
 
 
+class Kontaktdaten(BaseModel):
+    """Contact details printed on an invoice or in the email it came with."""
+
+    email: Optional[str] = None
+    telefon: Optional[str] = None
+    strasse: Optional[str] = None
+    plz: Optional[str] = None
+    ort: Optional[str] = None
+
+
+class LieferantAenderung(Kontaktdaten):
+    lieferant_id: int
+    ust_id: Optional[str] = None
+
+
 class Betrag(BaseModel):
     netto: float = Field(description="Net total of the invoice at this tax rate.")
     steuer_prozent: float = Field(default=19.0, ge=0, le=100)
@@ -127,6 +142,17 @@ class RechnungAblageRequest(BaseModel):
         description="Net totals per tax rate (usually one entry). Leave empty if the totals are unclear.",
     )
     anhaenge: list[Anhang] = Field(min_length=1)
+    kontakt: Optional[Kontaktdaten] = Field(
+        default=None,
+        description=(
+            "The supplier's contact details from the invoice or email signature. Missing "
+            "ones are added to the supplier in Odoo; existing ones are never overwritten."
+        ),
+    )
+    iban: Optional[str] = Field(
+        default=None,
+        description="IBAN printed on the invoice. Only compared with Odoo, never stored.",
+    )
 
     @field_validator("waehrung")
     @classmethod

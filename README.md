@@ -31,12 +31,20 @@ known suppliers qualify. For an unknown one the agent asks for approval to
 create it (`odoo_lieferant_anlegen`), then stores the invoice. Repeating it for
 the same invoice creates nothing twice.
 
+Contact details on the invoice or in its email (e-mail, phone, VAT id, address)
+are added to the supplier where Odoo has none; existing values are never
+overwritten. Differing ones go to `odoo_lieferant_aktualisieren` for approval.
+Bank details are never changed: an IBAN differing from the one in Odoo only
+adds a warning to the chat message, since a changed bank account is a common
+invoice fraud.
+
 **Other writes** need approval, each a prepare tool plus an `_execute` tool.
 There is no generic write.
 
 | Prepare tool | Effect after approval |
 | --- | --- |
 | `odoo_lieferant_anlegen` | New supplier with the details from its invoice. |
+| `odoo_lieferant_aktualisieren` | Changes a supplier's differing contact details. |
 | `odoo_anhang_ablegen` | Files on an invoice, order, partner or product. |
 | `odoo_material_anlegen` | New article, optionally with supplier and price. |
 | `odoo_einkaufspreis_aendern` | Changes one stored supplier price. |

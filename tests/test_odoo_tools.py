@@ -21,6 +21,7 @@ from terbox_mcp.odoo_models import (
     AnhangAblageRequest,
     EinkaufspreisRequest,
     Lieferant,
+    LieferantAenderung,
     MaterialRequest,
     PreisPruefPosition,
     RechnungAblageRequest,
@@ -352,6 +353,170 @@ def test_rejected_or_wrong_action_approval_cannot_execute(odoo: FakeOdoo, monkey
     approvals.decide(other.id, TENANT, approve=False)
     assert odoo_tools.odoo_lieferant_anlegen_execute(_ctx(), other.id)["status_code"] == 409
     assert odoo.writes() == []
+
+
+# --- supplier contact details -----------------------------------------------
+
+
+def _supplier_in_odoo(odoo: FakeOdoo, **fields) -> None:
+    row = {"id": 26, "email": False, "phone": False, "vat": False, "street": False, "zip": False, "city": False}
+    odoo.responses[("res.partner", "read")] = [{**row, **fields}]
+
+
+def _supplier_write(odoo: FakeOdoo) -> dict | None:
+    writes = [body for m, name, body in odoo.calls if (m, name) == ("res.partner", "write")]
+    assert len(writes) <= 1
+    return writes[0]["vals"] if writes else None
+
+
+def test_missing_contact_details_are_added_to_the_supplier(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    _supplier_in_odoo(odoo)
+
+    result = odoo_tools.odoo_rechnung_ablegen(
+        _rechnung(
+            ust_id="DE 111 222 333",
+            kontakt={"email": "buchhaltung@zaunbau.de", "strasse": "Weg 1", "plz": "45127", "ort": "Essen"},
+        )
+    )
+
+    assert _supplier_write(odoo) == {
+        "email": "buchhaltung@zaunbau.de",
+        "vat": "DE 111 222 333",
+        "street": "Weg 1",
+        "zip": "45127",
+        "city": "Essen",
+    }
+    assert "Beim Lieferanten ergänzt: E-Mail, Straße, PLZ, Ort, USt-IdNr." in result["meldung"]
+    assert "abweichende_kontaktdaten" not in result
+
+
+def test_existing_contact_details_are_never_overwritten(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    _supplier_in_odoo(odoo, email="info@zaunbau.de", street="Alte Str. 5", zip="45127", city="Essen")
+
+    result = odoo_tools.odoo_rechnung_ablegen(
+        _rechnung(kontakt={"email": "neu@zaunbau.de", "telefon": "0201 123", "strasse": "Neue Str. 9"})
+    )
+
+    assert _supplier_write(odoo) == {"phone": "0201 123"}  # only the empty one
+    assert result["abweichende_kontaktdaten"] == {
+        "email": {"bisher": "info@zaunbau.de", "neu": "neu@zaunbau.de"},
+        "strasse": {"bisher": "Alte Str. 5", "neu": "Neue Str. 9"},
+    }
+    assert result["status"] == "abgelegt"
+
+
+def test_same_detail_written_differently_is_not_a_change(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    _supplier_in_odoo(odoo, email="Info@Zaunbau.de", phone="+49 201 123456", vat="DE111222333", city="Essen")
+
+    result = odoo_tools.odoo_rechnung_ablegen(
+        _rechnung(ust_id="de 111222333", kontakt={"email": "info@zaunbau.de ", "telefon": "0201 / 123456", "ort": "ESSEN"})
+    )
+
+    assert _supplier_write(odoo) is None
+    assert "abweichende_kontaktdaten" not in result
+    assert "ergänzt" not in result["meldung"]
+
+
+def test_differing_iban_only_warns_and_is_never_stored(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    _supplier_in_odoo(odoo)
+    odoo.responses[("res.partner.bank", "search_read")] = [{"id": 1, "sanitized_account_number": "DE89370400440532013000"}]
+
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(iban="DE02 1203 0000 0000 2020 51"))
+
+    assert "andere IBAN" in result["meldung"]
+    assert all(model != "res.partner.bank" for model, _ in odoo.writes())
+    assert _supplier_write(odoo) is None
+
+
+def test_matching_iban_gives_no_warning(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    _supplier_in_odoo(odoo)
+    odoo.responses[("res.partner.bank", "search_read")] = [{"id": 1, "sanitized_account_number": "DE89370400440532013000"}]
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(iban="de89 3704 0044 0532 0130 00"))
+    assert "IBAN" not in result["meldung"]
+
+
+def test_contact_problem_never_costs_the_invoice(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    _supplier_in_odoo(odoo)
+    odoo.responses[("res.partner", "write")] = httpx.Response(400, json={"message": "invalid VAT number"})
+
+    result = odoo_tools.odoo_rechnung_ablegen(_rechnung(ust_id="XX-not-a-vat"))
+
+    assert result["status"] == "abgelegt"
+    assert ("account.move", "create") in odoo.writes()
+    assert "Kontaktdaten nicht ergänzt" in result["hinweis"]
+    assert "ergänzt:" not in result["meldung"]
+
+
+def test_client_refuses_to_change_other_supplier_fields() -> None:
+    client = OdooClient(OdooSettings(base_url="https://odoo.test", api_key="k"), transport=httpx.MockTransport(FakeOdoo()))
+    with pytest.raises(OdooAccessDenied):
+        client.update_supplier_contact(26, {"bank_ids": "x"})
+
+
+def test_changing_contact_details_needs_approval(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    _supplier_in_odoo(odoo, email="info@zaunbau.de")
+
+    pending = odoo_tools.odoo_lieferant_aktualisieren(
+        _ctx(), LieferantAenderung(lieferant_id=26, email="neu@zaunbau.de", telefon="0201 123")
+    )
+
+    assert pending.status == "pending"
+    assert "info@zaunbau.de → neu@zaunbau.de" in pending.message
+    assert odoo.writes() == []
+    assert odoo_tools.odoo_lieferant_aktualisieren_execute(_ctx(), pending.id)["status_code"] == 409
+
+    approvals.decide(pending.id, TENANT, approve=True, edits=dict(pending.payload))
+    result = odoo_tools.odoo_lieferant_aktualisieren_execute(_ctx(), pending.id)
+
+    assert result["geaendert"] == ["email", "telefon"]
+    assert _supplier_write(odoo) == {"email": "neu@zaunbau.de", "phone": "0201 123"}
+    assert odoo_tools.odoo_lieferant_aktualisieren_execute(_ctx(), pending.id)["status_code"] == 409
+
+
+def test_contact_change_is_refused_if_odoo_changed_meanwhile(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    _supplier_in_odoo(odoo, email="info@zaunbau.de")
+    pending = odoo_tools.odoo_lieferant_aktualisieren(_ctx(), LieferantAenderung(lieferant_id=26, email="neu@zaunbau.de"))
+    approvals.decide(pending.id, TENANT, approve=True)
+    _supplier_in_odoo(odoo, email="jemand@anders.de")
+
+    result = odoo_tools.odoo_lieferant_aktualisieren_execute(_ctx(), pending.id)
+
+    assert result["status_code"] == 409
+    assert odoo.writes() == []
+
+
+def test_value_cleared_on_the_card_is_skipped_not_erased(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    _supplier_in_odoo(odoo, email="info@zaunbau.de", phone="0201 1")
+    pending = odoo_tools.odoo_lieferant_aktualisieren(
+        _ctx(), LieferantAenderung(lieferant_id=26, email="neu@zaunbau.de", telefon="0201 2")
+    )
+    approvals.decide(pending.id, TENANT, approve=True, edits={"aenderungen.telefon.neu": ""})
+
+    odoo_tools.odoo_lieferant_aktualisieren_execute(_ctx(), pending.id)
+
+    assert _supplier_write(odoo) == {"email": "neu@zaunbau.de"}
+
+
+def test_nothing_to_change_is_refused(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    _supplier_in_odoo(odoo, email="info@zaunbau.de")
+    with pytest.raises(OdooError, match="already match"):
+        odoo_tools.odoo_lieferant_aktualisieren(_ctx(), LieferantAenderung(lieferant_id=26, email="INFO@zaunbau.de"))
+
+
+def test_contact_change_only_for_suppliers(odoo: FakeOdoo) -> None:
+    _odoo_for_bills(odoo)
+    with pytest.raises(OdooError, match="not a supplier"):
+        odoo_tools.odoo_lieferant_aktualisieren(_ctx(), LieferantAenderung(lieferant_id=99, email="x@y.de"))
 
 
 # --- attachments, materials, prices -----------------------------------------
